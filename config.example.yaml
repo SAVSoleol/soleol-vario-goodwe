@@ -1,10 +1,15 @@
 sites:
-  - name: "Client test"
-    device_sn: "REMPLACER_PAR_SN_BATTERIE_OU_ONDULEUR"
+  - name: Site test
+    device_sn: "REMPLACER_PAR_SN_ONDULEUR_OU_BATTERIE"
     datalogger_sn: "REMPLACER_PAR_SN_EZMANAGER"
     battery_capacity_kwh: 50
     charge_power_kw: 20
     discharge_power_kw: 20
     soc_min: 20
-    charge_target_soc: 95
-    discharge_target_soc: 20
+    soc_max: 95
+
+goodwe:
+  base_url: "https://openapi.goodwe.com"
+  # Ne jamais mettre les vraies clés dans GitHub.
+  authorization: ""
+  app_identifier: ""

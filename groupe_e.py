@@ -6,62 +6,54 @@ from typing import Any
 
 import requests
 
-
-GROUPE_E_TARIFF_URL = "https://api.tariffs.groupe-e.ch/v2/tariffs"
+VARIO_URL = "https://api.tariffs.groupe-e.ch/v2/tariffs"
 
 
 @dataclass(frozen=True)
-class PriceSlot:
+class TariffSlot:
     start: datetime
     end: datetime
-    grid_chf_kwh: float | None
-    integrated_chf_kwh: float | None
+    grid_chf_kwh: float
+    integrated_chf_kwh: float
 
 
-def _parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def _parse_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value)
 
 
-def _first_value(items: list[dict[str, Any]] | None) -> float | None:
+def _first_value(items: list[dict[str, Any]], default: float = 0.0) -> float:
     if not items:
-        return None
-    value = items[0].get("value")
-    return float(value) if value is not None else None
+        return default
+    return float(items[0].get("value", default))
 
 
-def fetch_vario_tariffs(timeout: int = 20) -> tuple[datetime | None, list[PriceSlot], dict[str, Any]]:
-    """Récupère les tarifs VARIO Groupe E.
-
-    L'API retourne en principe les 96 quarts d'heure publiés pour le lendemain.
-    """
-    response = requests.get(GROUPE_E_TARIFF_URL, timeout=timeout)
+def fetch_vario_tariffs(timeout: int = 20) -> tuple[str, list[TariffSlot], dict[str, Any]]:
+    """Fetch the currently published Groupe E VARIO 15-minute tariffs."""
+    response = requests.get(VARIO_URL, timeout=timeout, headers={"Accept": "application/json"})
     response.raise_for_status()
     payload: dict[str, Any] = response.json()
 
-    publication_raw = payload.get("publication_timestamp")
-    publication_timestamp = _parse_iso(publication_raw) if publication_raw else None
-
-    slots: list[PriceSlot] = []
+    slots: list[TariffSlot] = []
     for row in payload.get("prices", []):
         slots.append(
-            PriceSlot(
-                start=_parse_iso(row["start_timestamp"]),
-                end=_parse_iso(row["end_timestamp"]),
-                grid_chf_kwh=_first_value(row.get("grid")),
-                integrated_chf_kwh=_first_value(row.get("integrated")),
+            TariffSlot(
+                start=_parse_dt(row["start_timestamp"]),
+                end=_parse_dt(row["end_timestamp"]),
+                grid_chf_kwh=_first_value(row.get("grid", [])),
+                integrated_chf_kwh=_first_value(row.get("integrated", [])),
             )
         )
+    slots.sort(key=lambda s: s.start)
+    return str(payload.get("publication_timestamp", "")), slots, payload
 
-    return publication_timestamp, slots, payload
 
-
-def slots_to_rows(slots: list[PriceSlot]) -> list[dict[str, Any]]:
+def slots_to_rows(slots: list[TariffSlot]) -> list[dict[str, Any]]:
     return [
         {
-            "start": slot.start,
-            "end": slot.end,
-            "grid_chf_kwh": slot.grid_chf_kwh,
-            "integrated_chf_kwh": slot.integrated_chf_kwh,
+            "start": s.start,
+            "end": s.end,
+            "grid_chf_kwh": s.grid_chf_kwh,
+            "integrated_chf_kwh": s.integrated_chf_kwh,
         }
-        for slot in slots
+        for s in slots
     ]
