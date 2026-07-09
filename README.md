@@ -1,6 +1,16 @@
 # Soleol EMS — Groupe E VARIO → GoodWe EzManager
 
-Prototype Streamlit pour récupérer les tarifs dynamiques Groupe E VARIO, calculer une stratégie de charge/décharge et préparer l'envoi des consignes `BatteryCD` vers GoodWe OpenAPI.
+Prototype Streamlit pour récupérer les tarifs Groupe E VARIO et préparer une stratégie GoodWe `BatteryCD`.
+
+## Points clés v3
+
+- Utilise les deux prix de l'API Groupe E :
+  - `integrated_chf_kwh` = achat VARIO PLUS
+  - `grid_chf_kwh` = revente / grid VARIO
+- Optimisation économique avec rendement batterie.
+- Modes de charge : réseau, surplus PV, ou automatique.
+- Prépare les payloads GoodWe `BatteryCD`.
+- Mode test activé par défaut.
 
 ## Installation
 
@@ -9,31 +19,14 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Variables d'environnement
+## GoodWe
 
-Créer un fichier `.env` local :
+Renseigner les variables d'environnement dans `.env` :
 
 ```env
 GOODWE_BASE_URL=https://openapi.goodwe.com
-GOODWE_AUTHORIZATION=Bearer xxx
-GOODWE_APP_IDENTIFIER=xxx
+GOODWE_AUTHORIZATION=Bearer ...
+GOODWE_APP_IDENTIFIER=...
 ```
 
-Ne pas publier `.env` sur GitHub.
-
-## Fonctionnement
-
-1. Récupération des 96 prix Groupe E VARIO.
-2. Sélection des plages les moins chères pour charger.
-3. Sélection des plages les plus chères pour décharger.
-4. Génération du payload GoodWe `BatteryCD`.
-5. Envoi optionnel à GoodWe si le mode test est désactivé.
-
-## GoodWe
-
-Fonctions utilisées :
-
-- `setEmsDispatchMode` avec `dispatchMode = 1` pour activer le dispatch tiers sur l'EzManager.
-- `BatteryCD` pour envoyer une fenêtre de charge/décharge.
-
-À valider sur une installation de test avant tout déploiement client.
+Ne jamais mettre `.env` sur GitHub.
