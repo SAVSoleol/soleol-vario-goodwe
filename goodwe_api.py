@@ -5,7 +5,8 @@ from typing import Any
 
 import requests
 
-from optimizer import StrategyWindow, window_to_goodwe_data
+from dispatch import window_to_goodwe_data
+from optimizer import StrategyWindow
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,7 @@ class GoodWeClient:
         self.config = config
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.config.authorization:
             headers["Authorization"] = self.config.authorization
         if self.config.app_identifier:
@@ -34,9 +35,12 @@ class GoodWeClient:
         response = requests.post(url, json=payload, headers=self._headers(), timeout=self.config.timeout)
         try:
             data = response.json()
-        except Exception:
+        except ValueError:
             data = {"raw": response.text}
-        return {"status_code": response.status_code, "payload_sent": payload, "response": data}
+        result = {"status_code": response.status_code, "payload_sent": payload, "response": data}
+        if not response.ok:
+            result["error"] = f"GoodWe HTTP {response.status_code}"
+        return result
 
     def set_ems_third_party_dispatch(self, datalogger_sn: str) -> dict[str, Any]:
         return self.create_control_task(
@@ -45,12 +49,10 @@ class GoodWeClient:
         )
 
     def send_battery_windows(self, device_sn: str, windows: list[StrategyWindow]) -> list[dict[str, Any]]:
-        results = []
-        for window in windows:
-            results.append(
-                self.create_control_task(
-                    "BatteryCD",
-                    [{"sn": device_sn, "data": window_to_goodwe_data(window)}],
-                )
+        return [
+            self.create_control_task(
+                "BatteryCD",
+                [{"sn": device_sn, "data": window_to_goodwe_data(window)}],
             )
-        return results
+            for window in windows
+        ]

@@ -1,13 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Literal
 
+from forecast import ForecastSlot
 from groupe_e import TariffSlot
 
 Action = Literal["charge", "discharge", "idle"]
-ChargeSource = Literal["reseau", "pv_surplus", "mixte"]
+Source = Literal["pv_surplus", "grid", "battery", "none"]
+
+
+@dataclass(frozen=True)
+class DispatchStep:
+    start: datetime
+    end: datetime
+    action: Action
+    power_kw: float
+    energy_kwh: float
+    soc_start_pct: float
+    soc_end_pct: float
+    pv_kwh: float
+    load_kwh: float
+    grid_import_kwh: float
+    grid_export_kwh: float
+    buy_price_chf_kwh: float
+    sell_price_chf_kwh: float
+    source: Source
+    cost_chf: float
 
 
 @dataclass(frozen=True)
@@ -15,242 +35,217 @@ class StrategyWindow:
     action: Action
     start: datetime
     end: datetime
-    power_w: int
+    power_kw: float
     target_soc: int
-    avg_buy_price_chf_kwh: float
-    avg_sell_price_chf_kwh: float
-    avg_cost_price_chf_kwh: float
-    slots_count: int
     energy_kwh: float
-    source: ChargeSource = "mixte"
 
 
 @dataclass(frozen=True)
 class StrategyResult:
+    steps: list[DispatchStep]
     windows: list[StrategyWindow]
+    baseline_cost_chf: float
+    optimized_cost_chf: float
     estimated_gain_chf: float
     charged_energy_kwh: float
-    usable_charged_energy_kwh: float
     discharged_energy_kwh: float
-    avg_charge_cost: float
-    avg_discharge_value: float
+    final_soc_pct: float
     strategy_comment: str
 
 
-@dataclass(frozen=True)
-class _Candidate:
-    slot: TariffSlot
-    source: ChargeSource
-    cost_chf_kwh: float
+def _validate(slots: list[TariffSlot], forecast: list[ForecastSlot]) -> None:
+    if len(slots) != len(forecast):
+        raise ValueError("Les tarifs et la prévision n'ont pas le même nombre de pas.")
+    for s, f in zip(slots, forecast):
+        if s.start != f.start or s.end != f.end:
+            raise ValueError("Les pas tarifaires et énergétiques ne sont pas alignés.")
 
 
-def _ceil_div_energy(energy_kwh: float, power_kw: float, slot_h: float = 0.25) -> int:
-    if energy_kwh <= 0 or power_kw <= 0:
-        return 0
-    slot_energy = power_kw * slot_h
-    return int(-(-energy_kwh // slot_energy))
-
-
-def _group_charge_windows(selected: list[_Candidate], power_kw: float, target_soc: int) -> list[StrategyWindow]:
-    if not selected:
-        return []
-    selected = sorted(selected, key=lambda c: (c.source, c.slot.start))
-    groups: list[list[_Candidate]] = [[selected[0]]]
-    for cand in selected[1:]:
-        last = groups[-1][-1]
-        if cand.source == last.source and cand.slot.start == last.slot.end:
-            groups[-1].append(cand)
+def _baseline_cost(slots: list[TariffSlot], forecast: list[ForecastSlot]) -> float:
+    total = 0.0
+    for s, f in zip(slots, forecast):
+        net = f.load_kwh - f.pv_kwh
+        if net >= 0:
+            total += net * s.integrated_chf_kwh
         else:
-            groups.append([cand])
-
-    out: list[StrategyWindow] = []
-    for group in groups:
-        slots = [c.slot for c in group]
-        hours = sum((s.end - s.start).total_seconds() for s in slots) / 3600
-        energy = round(hours * power_kw, 3)
-        out.append(
-            StrategyWindow(
-                action="charge",
-                start=slots[0].start,
-                end=slots[-1].end,
-                power_w=int(round(power_kw * 1000)),
-                target_soc=int(target_soc),
-                avg_buy_price_chf_kwh=sum(s.integrated_chf_kwh for s in slots) / len(slots),
-                avg_sell_price_chf_kwh=sum(s.grid_chf_kwh for s in slots) / len(slots),
-                avg_cost_price_chf_kwh=sum(c.cost_chf_kwh for c in group) / len(group),
-                slots_count=len(group),
-                energy_kwh=energy,
-                source=group[0].source,
-            )
-        )
-    return out
+            total -= (-net) * s.grid_chf_kwh
+    return total
 
 
-def _group_discharge_windows(selected: list[TariffSlot], power_kw: float, target_soc: int) -> list[StrategyWindow]:
-    if not selected:
-        return []
-    selected = sorted(selected, key=lambda s: s.start)
-    groups: list[list[TariffSlot]] = [[selected[0]]]
-    for slot in selected[1:]:
-        if slot.start == groups[-1][-1].end:
-            groups[-1].append(slot)
-        else:
-            groups.append([slot])
-
-    out: list[StrategyWindow] = []
-    for group in groups:
-        hours = sum((s.end - s.start).total_seconds() for s in group) / 3600
-        energy = round(hours * power_kw, 3)
-        avg_buy = sum(s.integrated_chf_kwh for s in group) / len(group)
-        avg_sell = sum(s.grid_chf_kwh for s in group) / len(group)
-        out.append(
-            StrategyWindow(
-                action="discharge",
-                start=group[0].start,
-                end=group[-1].end,
-                power_w=int(round(power_kw * 1000)),
-                target_soc=int(target_soc),
-                avg_buy_price_chf_kwh=avg_buy,
-                avg_sell_price_chf_kwh=avg_sell,
-                avg_cost_price_chf_kwh=avg_buy,
-                slots_count=len(group),
-                energy_kwh=energy,
-                source="mixte",
-            )
-        )
-    return out
+def _future_buy_threshold(slots: list[TariffSlot], idx: int, lookahead_slots: int = 24) -> float:
+    future = [x.integrated_chf_kwh for x in slots[idx + 1 : idx + 1 + lookahead_slots]]
+    return max(future) if future else slots[idx].integrated_chf_kwh
 
 
-def build_strategy(
+def optimize_day(
     slots: list[TariffSlot],
+    forecast: list[ForecastSlot],
     *,
     battery_capacity_kwh: float,
     charge_power_kw: float,
     discharge_power_kw: float,
-    soc_start: int,
-    soc_min: int,
-    charge_target_soc: int,
-    discharge_target_soc: int,
-    roundtrip_efficiency: float = 0.90,
-    charge_policy: Literal["reseau", "pv_surplus", "auto"] = "auto",
-    max_windows_per_action: int = 4,
-    min_margin_chf_kwh: float = 0.01,
+    soc_start_pct: float,
+    soc_min_pct: float,
+    soc_max_pct: float,
+    charge_efficiency: float = 0.95,
+    discharge_efficiency: float = 0.95,
+    allow_grid_charge: bool = True,
+    min_arbitrage_margin_chf_kwh: float = 0.02,
 ) -> StrategyResult:
-    """Optimiseur économique VARIO.
+    """Transparent greedy EMS simulation over the 96 quarter-hour slots.
 
-    Hypothèses :
-    - integrated_chf_kwh = prix d'achat réseau VARIO PLUS.
-    - grid_chf_kwh = valeur d'injection / coût d'opportunité du surplus PV.
-
-    Si charge_policy="reseau", la batterie est chargée sur les heures d'achat les moins chères.
-    Si charge_policy="pv_surplus", la charge est planifiée lorsque la valeur d'injection est la plus basse.
-    Si charge_policy="auto", l'algorithme retient le meilleur coût entre réseau et surplus PV.
+    Priority:
+    1. Serve load with PV.
+    2. Store PV surplus when its injection value is below a future avoided-buy value.
+    3. Discharge during high buy-price slots.
+    4. Optionally charge from grid when future spread covers losses and margin.
     """
-    if not slots:
-        return StrategyResult([], 0, 0, 0, 0, 0, 0, "Aucune donnée tarifaire.")
+    _validate(slots, forecast)
+    if battery_capacity_kwh <= 0:
+        raise ValueError("La capacité batterie doit être positive.")
 
-    eta = max(0.01, min(roundtrip_efficiency, 1.0))
-    slot_h = 0.25
+    soc_min_kwh = battery_capacity_kwh * soc_min_pct / 100
+    soc_max_kwh = battery_capacity_kwh * soc_max_pct / 100
+    stored_kwh = min(max(battery_capacity_kwh * soc_start_pct / 100, soc_min_kwh), soc_max_kwh)
+    baseline = _baseline_cost(slots, forecast)
+    optimized_cost = 0.0
+    steps: list[DispatchStep] = []
 
-    energy_to_full_kwh = max(0.0, battery_capacity_kwh * (charge_target_soc - soc_start) / 100)
-    max_discharge_from_target_kwh = max(0.0, battery_capacity_kwh * (charge_target_soc - discharge_target_soc) / 100)
-    current_discharge_available_kwh = max(0.0, battery_capacity_kwh * (soc_start - discharge_target_soc) / 100)
+    for i, (slot, fc) in enumerate(zip(slots, forecast)):
+        duration_h = (slot.end - slot.start).total_seconds() / 3600
+        max_charge_input = charge_power_kw * duration_h
+        max_discharge_output = discharge_power_kw * duration_h
+        soc_before = stored_kwh / battery_capacity_kwh * 100
 
-    planned_charge_kwh = min(energy_to_full_kwh, charge_power_kw * slot_h * len(slots))
-    usable_from_planned_charge = planned_charge_kwh * eta
-    planned_discharge_kwh = min(max_discharge_from_target_kwh, current_discharge_available_kwh + usable_from_planned_charge)
+        pv_to_load = min(fc.pv_kwh, fc.load_kwh)
+        residual_load = fc.load_kwh - pv_to_load
+        surplus_pv = fc.pv_kwh - pv_to_load
 
-    charge_slots_needed = _ceil_div_energy(planned_charge_kwh, charge_power_kw, slot_h)
-    discharge_slots_needed = _ceil_div_energy(planned_discharge_kwh, discharge_power_kw, slot_h)
+        charge_input = 0.0
+        discharge_output = 0.0
+        grid_import = 0.0
+        grid_export = 0.0
+        source: Source = "none"
 
-    charge_candidates: list[_Candidate] = []
-    for slot in slots:
-        if charge_policy in ("reseau", "auto"):
-            charge_candidates.append(_Candidate(slot=slot, source="reseau", cost_chf_kwh=slot.integrated_chf_kwh))
-        if charge_policy in ("pv_surplus", "auto"):
-            charge_candidates.append(_Candidate(slot=slot, source="pv_surplus", cost_chf_kwh=slot.grid_chf_kwh))
+        future_high = _future_buy_threshold(slots, i)
+        pv_storage_value = future_high * discharge_efficiency - slot.grid_chf_kwh
 
-    selected_charge: list[_Candidate] = []
-    used_charge_slots: set[datetime] = set()
-    for cand in sorted(charge_candidates, key=lambda c: (c.cost_chf_kwh, c.slot.start)):
-        if len(selected_charge) >= charge_slots_needed:
-            break
-        # Ne pas prendre deux sources pour le même quart d'heure.
-        if cand.slot.start in used_charge_slots:
-            continue
-        selected_charge.append(cand)
-        used_charge_slots.add(cand.slot.start)
+        # PV surplus first.
+        if surplus_pv > 0 and pv_storage_value >= min_arbitrage_margin_chf_kwh:
+            room_input = max(0.0, (soc_max_kwh - stored_kwh) / charge_efficiency)
+            charge_input = min(surplus_pv, max_charge_input, room_input)
+            stored_kwh += charge_input * charge_efficiency
+            surplus_pv -= charge_input
+            source = "pv_surplus" if charge_input > 0 else "none"
 
-    # Décharge uniquement sur les prix d'achat les plus élevés, hors créneaux de charge.
-    discharge_candidates = [s for s in slots if s.start not in used_charge_slots]
-    selected_discharge = sorted(discharge_candidates, key=lambda s: (s.integrated_chf_kwh, s.start), reverse=True)[:discharge_slots_needed]
+        # Battery serves load when current price is sufficiently valuable.
+        if residual_load > 0:
+            available_output = max(0.0, (stored_kwh - soc_min_kwh) * discharge_efficiency)
+            # A simple threshold: use battery if current price is above daily median-ish level.
+            sorted_prices = sorted(s.integrated_chf_kwh for s in slots)
+            high_price_threshold = sorted_prices[int(0.65 * (len(sorted_prices) - 1))]
+            if slot.integrated_chf_kwh >= high_price_threshold:
+                discharge_output = min(residual_load, max_discharge_output, available_output)
+                stored_kwh -= discharge_output / discharge_efficiency
+                residual_load -= discharge_output
+                if discharge_output > 0:
+                    source = "battery"
 
-    charge_windows = _group_charge_windows(selected_charge, charge_power_kw, charge_target_soc)
-    discharge_windows = _group_discharge_windows(selected_discharge, discharge_power_kw, discharge_target_soc)
+        # Optional grid charging if future arbitrage spread is sufficient.
+        if allow_grid_charge and charge_input == 0 and residual_load >= 0:
+            effective_charge_cost = slot.integrated_chf_kwh / max(charge_efficiency * discharge_efficiency, 0.01)
+            spread = future_high - effective_charge_cost
+            if spread >= min_arbitrage_margin_chf_kwh:
+                room_input = max(0.0, (soc_max_kwh - stored_kwh) / charge_efficiency)
+                grid_charge = min(max_charge_input, room_input)
+                if grid_charge > 0:
+                    charge_input += grid_charge
+                    stored_kwh += grid_charge * charge_efficiency
+                    grid_import += grid_charge
+                    source = "grid"
 
-    # Limite le nombre de fenêtres envoyées à GoodWe si la stratégie est fragmentée.
-    charge_windows = sorted(charge_windows, key=lambda w: (w.avg_cost_price_chf_kwh, -w.energy_kwh))[:max_windows_per_action]
-    discharge_windows = sorted(discharge_windows, key=lambda w: (-w.avg_buy_price_chf_kwh, -w.energy_kwh))[:max_windows_per_action]
-    windows = sorted(charge_windows + discharge_windows, key=lambda w: w.start)
+        grid_import += max(0.0, residual_load)
+        grid_export += max(0.0, surplus_pv)
 
-    charged_energy = sum(w.energy_kwh for w in charge_windows)
-    usable_charged = charged_energy * eta
-    discharged_energy = min(sum(w.energy_kwh for w in discharge_windows), current_discharge_available_kwh + usable_charged)
+        slot_cost = grid_import * slot.integrated_chf_kwh - grid_export * slot.grid_chf_kwh
+        optimized_cost += slot_cost
+        soc_after = stored_kwh / battery_capacity_kwh * 100
 
-    avg_charge_cost = (
-        sum(w.avg_cost_price_chf_kwh * w.energy_kwh for w in charge_windows) / charged_energy if charged_energy else 0.0
-    )
-    total_discharge_window_energy = sum(w.energy_kwh for w in discharge_windows)
-    avg_discharge_value = (
-        sum(w.avg_buy_price_chf_kwh * w.energy_kwh for w in discharge_windows) / total_discharge_window_energy
-        if total_discharge_window_energy
-        else 0.0
-    )
+        if charge_input > 1e-6:
+            action: Action = "charge"
+            energy = charge_input
+            power = charge_input / duration_h
+        elif discharge_output > 1e-6:
+            action = "discharge"
+            energy = discharge_output
+            power = discharge_output / duration_h
+        else:
+            action = "idle"
+            energy = 0.0
+            power = 0.0
 
-    # Coût de charge sur l'énergie entrée batterie, valeur de décharge sur l'énergie sortie utilisable.
-    charge_cost = charged_energy * avg_charge_cost
-    discharge_value = discharged_energy * avg_discharge_value
-    gross_gain = discharge_value - charge_cost
+        steps.append(
+            DispatchStep(
+                start=slot.start,
+                end=slot.end,
+                action=action,
+                power_kw=round(power, 3),
+                energy_kwh=round(energy, 4),
+                soc_start_pct=round(soc_before, 2),
+                soc_end_pct=round(soc_after, 2),
+                pv_kwh=round(fc.pv_kwh, 4),
+                load_kwh=round(fc.load_kwh, 4),
+                grid_import_kwh=round(grid_import, 4),
+                grid_export_kwh=round(grid_export, 4),
+                buy_price_chf_kwh=slot.integrated_chf_kwh,
+                sell_price_chf_kwh=slot.grid_chf_kwh,
+                source=source,
+                cost_chf=round(slot_cost, 5),
+            )
+        )
 
-    if discharged_energy > 0 and charged_energy > 0:
-        margin = (discharge_value / discharged_energy) - (charge_cost / max(usable_charged, 0.001))
-    else:
-        margin = 0.0
-
-    if gross_gain <= 0 or margin < min_margin_chf_kwh:
-        comment = "Gain net faible ou négatif selon les hypothèses. Vérifier avant envoi réel."
-    elif charge_policy == "pv_surplus":
-        comment = "Optimisation basée sur la valeur d'injection VARIO grid. Nécessite du surplus PV réel sur les créneaux de charge."
-    elif charge_policy == "reseau":
-        comment = "Optimisation par arbitrage réseau : charge aux prix d'achat bas, décharge aux prix d'achat hauts."
-    else:
-        comment = "Optimisation auto : coût de charge le plus bas entre réseau et opportunité d'injection PV."
-
+    windows = steps_to_windows(steps)
+    gain = baseline - optimized_cost
     return StrategyResult(
+        steps=steps,
         windows=windows,
-        estimated_gain_chf=round(max(0.0, gross_gain), 2),
-        charged_energy_kwh=round(charged_energy, 3),
-        usable_charged_energy_kwh=round(usable_charged, 3),
-        discharged_energy_kwh=round(discharged_energy, 3),
-        avg_charge_cost=round(avg_charge_cost, 4),
-        avg_discharge_value=round(avg_discharge_value, 4),
-        strategy_comment=comment,
+        baseline_cost_chf=round(baseline, 2),
+        optimized_cost_chf=round(optimized_cost, 2),
+        estimated_gain_chf=round(gain, 2),
+        charged_energy_kwh=round(sum(s.energy_kwh for s in steps if s.action == "charge"), 2),
+        discharged_energy_kwh=round(sum(s.energy_kwh for s in steps if s.action == "discharge"), 2),
+        final_soc_pct=round(stored_kwh / battery_capacity_kwh * 100, 1),
+        strategy_comment="Simulation énergétique sur 96 pas avec PV, consommation, achat, revente et SOC.",
     )
 
 
-def _to_utc_seconds(dt: datetime) -> int:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.astimezone(timezone.utc).timestamp())
+def steps_to_windows(steps: list[DispatchStep]) -> list[StrategyWindow]:
+    active = [s for s in steps if s.action != "idle"]
+    if not active:
+        return []
+    groups: list[list[DispatchStep]] = [[active[0]]]
+    for step in active[1:]:
+        prev = groups[-1][-1]
+        same_action = step.action == prev.action
+        contiguous = step.start == prev.end
+        similar_power = abs(step.power_kw - prev.power_kw) <= max(0.5, prev.power_kw * 0.10)
+        if same_action and contiguous and similar_power:
+            groups[-1].append(step)
+        else:
+            groups.append([step])
 
-
-def window_to_goodwe_data(window: StrategyWindow) -> dict[str, int]:
-    mode = {"idle": 1, "charge": 2, "discharge": 3}[window.action]
-    return {
-        "BatteryCDEnable": 1,
-        "BatteryCDMode": mode,
-        "BatteryCDPW": int(window.power_w),
-        "BatteryCDTargetSOC": int(window.target_soc),
-        "CDStartTime": _to_utc_seconds(window.start),
-        "CDEndTime": _to_utc_seconds(window.end),
-    }
+    out: list[StrategyWindow] = []
+    for g in groups:
+        avg_power = sum(s.power_kw for s in g) / len(g)
+        target = round(g[-1].soc_end_pct)
+        out.append(
+            StrategyWindow(
+                action=g[0].action,
+                start=g[0].start,
+                end=g[-1].end,
+                power_kw=round(avg_power, 2),
+                target_soc=int(target),
+                energy_kwh=round(sum(s.energy_kwh for s in g), 3),
+            )
+        )
+    return out

@@ -1,27 +1,35 @@
-# Soleol EMS — Groupe E VARIO → GoodWe EzManager
+# Soleol EMS VARIO — v4
 
-Prototype Streamlit pour récupérer les tarifs Groupe E VARIO et préparer une stratégie GoodWe `BatteryCD`.
+Prototype Streamlit manuel pour :
 
-## Points clés v3
+- récupérer les 96 tarifs Groupe E VARIO ;
+- créer une prévision PV/consommation théorique ou importer un CSV ;
+- simuler la batterie sur 96 pas de 15 minutes ;
+- comparer le coût sans et avec EMS ;
+- convertir le résultat en fenêtres GoodWe `BatteryCD` ;
+- envoyer manuellement les commandes en mode réel.
 
-- Utilise les deux prix de l'API Groupe E :
-  - `integrated_chf_kwh` = achat VARIO PLUS
-  - `grid_chf_kwh` = revente / grid VARIO
-- Optimisation économique avec rendement batterie.
-- Modes de charge : réseau, surplus PV, ou automatique.
-- Prépare les payloads GoodWe `BatteryCD`.
-- Mode test activé par défaut.
-
-## Installation
+## Lancer
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## CSV de prévision
+
+Colonnes obligatoires :
+
+```text
+timestamp,pv_kwh,load_kwh
+2026-07-09T00:00:00+02:00,0,0.8
+```
+
+Une ligne par quart d'heure, alignée sur les tarifs Groupe E.
+
 ## GoodWe
 
-Renseigner les variables d'environnement dans `.env` :
+Créer un fichier `.env` local :
 
 ```env
 GOODWE_BASE_URL=https://openapi.goodwe.com
@@ -29,4 +37,4 @@ GOODWE_AUTHORIZATION=Bearer ...
 GOODWE_APP_IDENTIFIER=...
 ```
 
-Ne jamais mettre `.env` sur GitHub.
+Le mode test est activé par défaut. Vérifier les noms exacts des champs GoodWe sur une installation pilote avant tout envoi réel.
