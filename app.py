@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import io
+
+import pandas as pd
+import streamlit as st
+
+from analysis_engine import compare, monthly_summary
+from data_import import prepare_consumption, read_csv_flexible
+from groupe_e import fetch_vario_date_range
+
+st.set_page_config(page_title="Soleol — Double vs VARIO", layout="wide")
+st.title("Analyse tarifaire Groupe E")
+st.caption("Question analysée : combien ce client aurait-il économisé avec VARIO plutôt qu'avec le tarif Double ?")
+
+with st.sidebar:
+    st.header("1. Profil client")
+    site_name = st.text_input("Client / site", value="Client test")
+    uploaded = st.file_uploader("Profil de soutirage réseau (CSV)", type=["csv", "txt"])
+
+    st.header("2. Tarif Double")
+    st.caption("Renseigner les prix d'achat sur la même base que le prix VARIO comparé.")
+    high_ct = st.number_input("Haut tarif (ct/kWh)", min_value=0.0, value=31.0, step=0.1)
+    low_ct = st.number_input("Bas tarif (ct/kWh)", min_value=0.0, value=21.0, step=0.1)
+    add_vat = st.toggle("Ajouter TVA 8.1 % aux deux scénarios", value=False)
+
+if uploaded is None:
+    st.info("Importe le profil de soutirage réseau du client pour commencer. Le fichier doit contenir au minimum une date/heure et une valeur de consommation.")
+    st.stop()
+
+try:
+    raw_df = read_csv_flexible(uploaded.getvalue())
+except Exception as exc:
+    st.error(f"Lecture du fichier impossible : {exc}")
+    st.stop()
+
+with st.sidebar:
+    st.header("3. Colonnes du fichier")
+    cols = list(raw_df.columns)
+    default_ts = next((c for c in cols if any(k in str(c).lower() for k in ["time", "date", "timestamp", "heure"])), cols[0])
+    other = [c for c in cols if c != default_ts]
+    default_val = next((c for c in other if any(k in str(c).lower() for k in ["kwh", "wh", "cons", "import", "energy", "energie"])), other[0] if other else cols[0])
+    timestamp_col = st.selectbox("Date / heure", cols, index=cols.index(default_ts))
+    value_col = st.selectbox("Soutirage / consommation", cols, index=cols.index(default_val))
+    unit = st.selectbox(
+        "Unité de la valeur",
+        ["kWh par intervalle", "Wh par intervalle", "kW (puissance moyenne)", "W (puissance moyenne)"],
+        index=0,
+    )
+
+try:
+    consumption = prepare_consumption(raw_df, timestamp_col=timestamp_col, value_col=value_col, unit=unit)
+except Exception as exc:
+    st.error(f"Profil client invalide : {exc}")
+    st.stop()
+
+if consumption.empty:
+    st.error("Le fichier ne contient aucune consommation exploitable.")
+    st.stop()
+
+start_date = consumption["timestamp"].min().date()
+end_date = consumption["timestamp"].max().date()
+
+with st.sidebar:
+    st.header("4. Période")
+    st.write(f"Détectée : **{start_date.strftime('%d.%m.%Y')} → {end_date.strftime('%d.%m.%Y')}**")
+    date_range = st.date_input("Période à analyser", value=(start_date, end_date), min_value=start_date, max_value=end_date)
+
+if not isinstance(date_range, (tuple, list)) or len(date_range) != 2:
+    st.info("Sélectionne une date de début et une date de fin.")
+    st.stop()
+sel_start, sel_end = date_range
+
+consumption = consumption[
+    (consumption["timestamp"].dt.date >= sel_start) & (consumption["timestamp"].dt.date <= sel_end)
+].copy()
+
+if st.button("Analyser Double vs VARIO", type="primary"):
+    try:
+        with st.spinner("Récupération des prix VARIO Groupe E et calcul..."):
+            publication, slots = fetch_vario_date_range(sel_start, sel_end)
+            tariffs = pd.DataFrame({
+                "timestamp": [pd.Timestamp(s.start) for s in slots],
+                "vario_chf_kwh": [s.integrated_chf_kwh for s in slots],
+            })
+            merged = consumption.merge(tariffs, on="timestamp", how="inner")
+
+            expected = len(consumption)
+            matched = len(merged)
+            if matched == 0:
+                raise ValueError("Aucun quart d'heure du profil client ne correspond aux prix VARIO disponibles.")
+
+            high = high_ct * (1.081 if add_vat else 1.0)
+            low = low_ct * (1.081 if add_vat else 1.0)
+            if add_vat:
+                merged["vario_chf_kwh"] *= 1.081
+
+            result, detail = compare(merged, high, low)
+            st.session_state["analysis"] = (result, detail, publication, expected, matched, site_name, sel_start, sel_end)
+    except Exception as exc:
+        st.error(f"Analyse impossible : {exc}")
+
+if "analysis" not in st.session_state:
+    st.subheader("Aperçu du profil importé")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Période détectée", f"{start_date.strftime('%d.%m.%Y')} → {end_date.strftime('%d.%m.%Y')}")
+    c2.metric("Soutirage détecté", f"{consumption['consumption_kwh'].sum():,.0f} kWh".replace(",", "'"))
+    c3.metric("Pas de 15 min", f"{len(consumption):,}".replace(",", "'"))
+    st.dataframe(consumption.head(20), use_container_width=True, hide_index=True)
+    st.stop()
+
+result, detail, publication, expected, matched, site_name, sel_start, sel_end = st.session_state["analysis"]
+coverage = matched / expected * 100 if expected else 0.0
+
+st.subheader(f"Résultat — {site_name}")
+st.caption(f"Période analysée : {sel_start.strftime('%d.%m.%Y')} → {sel_end.strftime('%d.%m.%Y')} · Couverture VARIO : {matched:,}/{expected:,} pas ({coverage:.1f} %)".replace(",", "'"))
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Tarif Double", f"{result.double_cost_chf:,.2f} CHF".replace(",", "'"))
+m2.metric("Tarif VARIO", f"{result.vario_cost_chf:,.2f} CHF".replace(",", "'"))
+m3.metric(
+    "Économie avec VARIO",
+    f"{result.saving_chf:,.2f} CHF".replace(",", "'"),
+    delta=f"{result.saving_pct:.1f} %",
+)
+
+if result.saving_chf >= 0:
+    st.success(
+        f"Avec exactement le même profil de soutirage, VARIO aurait économisé "
+        f"{result.saving_chf:,.2f} CHF ({result.saving_pct:.1f} %) sur la période analysée.".replace(",", "'")
+    )
+else:
+    st.warning(
+        f"Avec exactement le même profil de soutirage, VARIO aurait coûté "
+        f"{abs(result.saving_chf):,.2f} CHF de plus ({abs(result.saving_pct):.1f} %) sur la période analysée.".replace(",", "'")
+    )
+
+k1, k2, k3 = st.columns(3)
+k1.metric("Soutirage analysé", f"{result.consumption_kwh:,.0f} kWh".replace(",", "'"))
+k2.metric("Prix moyen Double", f"{result.avg_double_ct_kwh:.2f} ct/kWh")
+k3.metric("Prix moyen VARIO pondéré", f"{result.avg_vario_ct_kwh:.2f} ct/kWh")
+
+st.subheader("Comparaison mensuelle")
+monthly = monthly_summary(detail)
+chart = monthly.set_index("month")[["tarif_Double_CHF", "tarif_VARIO_CHF"]].rename(
+    columns={"tarif_Double_CHF": "Double", "tarif_VARIO_CHF": "VARIO"}
+)
+st.bar_chart(chart, height=320)
+
+view = monthly.copy()
+for c in ["consommation_kWh", "tarif_Double_CHF", "tarif_VARIO_CHF", "economie_CHF", "economie_pct"]:
+    view[c] = view[c].round(2)
+st.dataframe(view, use_container_width=True, hide_index=True)
+
+st.subheader("Détail de contrôle")
+detail_view = detail[["timestamp", "consumption_kwh", "double_ct_kwh", "vario_chf_kwh", "double_cost_chf", "vario_cost_chf"]].copy()
+detail_view["VARIO_ct_kWh"] = detail_view["vario_chf_kwh"] * 100.0
+detail_view = detail_view.drop(columns=["vario_chf_kwh"])
+st.dataframe(detail_view.head(1000), use_container_width=True, hide_index=True, height=300)
+
+csv_bytes = detail_view.to_csv(index=False).encode("utf-8-sig")
+st.download_button("Télécharger le détail CSV", data=csv_bytes, file_name="comparaison_double_vario.csv", mime="text/csv")
+
+st.caption("Le calcul compare uniquement le coût d'achat de l'électricité pour le même soutirage réseau. Il ne simule ni batterie, ni photovoltaïque, ni déplacement de consommation.")
