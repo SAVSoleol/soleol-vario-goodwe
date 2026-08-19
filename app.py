@@ -9,9 +9,11 @@ import streamlit as st
 
 from billing import compare_double_vario
 from groupe_e_api import fetch_vario
-from meter_loader import UnsupportedFormatError, load_consumption_file
+from meter_loader import load_consumption_file
 
 st.set_page_config(page_title="Soleol — Double vs VARIO", layout="wide")
+
+VARIO_HISTORY_START = pd.Timestamp("2025-12-11 00:00:00")
 
 st.markdown("""
 <style>
@@ -32,7 +34,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("Analyse tarifaire Groupe E")
-st.caption("Question : combien ce client aurait-il économisé avec VARIO plutôt qu'avec le tarif Double ?")
+st.caption("Combien ce client aurait-il économisé avec VARIO plutôt qu'avec le tarif Double ?")
 
 with st.sidebar:
     st.header("1. Client")
@@ -44,7 +46,7 @@ with st.sidebar:
     )
 
     st.header("2. Tarif Double")
-    st.caption("Prix totaux variables à comparer au prix VARIO intégré. Frais fixes identiques exclus.")
+    st.caption("Prix variables à comparer au prix VARIO intégré. Frais fixes identiques exclus.")
     ht_ct = st.number_input("Haut tarif (ct/kWh)", min_value=0.0, value=29.32, step=0.01, format="%.2f")
     bt_ct = st.number_input("Bas tarif (ct/kWh)", min_value=0.0, value=19.27, step=0.01, format="%.2f")
     st.caption("HT : 07h–12h et 17h–23h. BT : le reste.")
@@ -75,6 +77,7 @@ st.success(
     f"Fichier reconnu automatiquement : {meta.vendor} · "
     f"{meta.n_rows:,} mesures · pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}"
 )
+
 with st.expander("Détails de détection"):
     st.write(f"**Colonne date/heure :** {meta.date_column}")
     st.write(f"**Colonne soutirage :** {meta.import_column}")
@@ -85,28 +88,39 @@ with st.expander("Détails de détection"):
     )
     st.write(f"**Soutirage total du fichier :** {load_df.import_kWh.sum():,.0f} kWh".replace(",", " "))
 
-# Give a small visual confirmation before API call.
 preview = load_df.head(8).copy()
 preview["timestamp"] = preview["timestamp"].dt.strftime("%d.%m.%Y %H:%M")
 with st.expander("Aperçu des mesures"):
     st.dataframe(preview, use_container_width=True, hide_index=True)
 
 if st.button("Comparer Double vs VARIO", type="primary"):
-    start = load_df["timestamp"].min().floor("15min")
-    end = load_df["timestamp"].max().ceil("15min") + pd.Timedelta(minutes=15)
+    # Historical API window: always request from the known beginning of available history
+    # up to today, but never beyond the client's own data range.
+    today = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+    client_start = load_df["timestamp"].min().floor("15min")
+    client_end = load_df["timestamp"].max().ceil("15min") + pd.Timedelta(minutes=15)
 
-    with st.spinner("Récupération de l'historique VARIO Groupe E..."):
+    api_start = max(VARIO_HISTORY_START, client_start)
+    api_end = min(today.ceil("15min"), client_end)
+
+    if api_end <= api_start:
+        st.error(
+            "Le fichier client ne chevauche pas encore l'historique VARIO disponible "
+            "depuis le 11.12.2025."
+        )
+        st.stop()
+
+    with st.spinner("Récupération de tout l'historique VARIO disponible..."):
         try:
-            vario, publication = fetch_vario(start, end)
+            vario, publication = fetch_vario(api_start, api_end)
         except Exception as exc:
             st.error(f"API Groupe E : {exc}")
             st.stop()
 
     if vario.empty:
-        st.error("Aucun prix VARIO n'est disponible pour la période de ce fichier.")
+        st.error("Aucun prix VARIO n'est disponible pour la période commune.")
         st.stop()
 
-    # Merge strictly on quarter-hour start labels.
     data = load_df.copy()
     data["timestamp"] = data["timestamp"].dt.floor("15min")
     merged = data.merge(vario, on="timestamp", how="inner")
@@ -124,12 +138,18 @@ if st.button("Comparer Double vs VARIO", type="primary"):
         vat_factor=1.081 if vat else 1.0,
     )
 
-    file_points = len(data)
-    compared_points = len(calc)
-    coverage = compared_points / file_points * 100.0 if file_points else 0.0
-    compared_days = compared_points * meta.dt_hours / 24.0
+    # Coverage is assessed only on the period that could theoretically be compared,
+    # not on the entire customer file if it starts before 11 Dec 2025.
+    theoretical = data[
+        (data["timestamp"] >= api_start) &
+        (data["timestamp"] < api_end)
+    ]
+    comparable_points = len(calc)
+    theoretical_points = len(theoretical)
+    coverage = comparable_points / theoretical_points * 100.0 if theoretical_points else 0.0
+    compared_days = comparable_points * meta.dt_hours / 24.0
 
-    st.subheader("Résultat")
+    st.subheader("Résultat cumulé")
     c1, c2, c3 = st.columns(3)
     c1.metric("Tarif Double", f"{r['double_chf']:,.2f} CHF".replace(",", " "))
     c2.metric("Tarif VARIO", f"{r['vario_chf']:,.2f} CHF".replace(",", " "))
@@ -141,13 +161,13 @@ if st.button("Comparer Double vs VARIO", type="primary"):
 
     if r["saving_chf"] >= 0:
         st.success(
-            f"Sur la période réellement comparable, "
+            f"Sur toute la période comparable, "
             f"**{client or 'ce client'} aurait économisé {r['saving_chf']:,.2f} CHF "
             f"({r['saving_pct']:.1f} %) avec VARIO**.".replace(",", " ")
         )
     else:
         st.warning(
-            f"Sur la période réellement comparable, "
+            f"Sur toute la période comparable, "
             f"**VARIO aurait coûté {abs(r['saving_chf']):,.2f} CHF de plus "
             f"({abs(r['saving_pct']):.1f} %) à {client or 'ce client'}**.".replace(",", " ")
         )
@@ -156,42 +176,113 @@ if st.button("Comparer Double vs VARIO", type="primary"):
     q1.metric("Consommation comparée", f"{r['energy_kwh']:,.0f} kWh".replace(",", " "))
     q2.metric("Prix moyen Double", f"{r['avg_double_chf_kwh']*100:.2f} ct/kWh")
     q3.metric("Prix moyen VARIO", f"{r['avg_vario_chf_kwh']*100:.2f} ct/kWh")
-    q4.metric("Couverture du fichier", f"{coverage:.1f} %")
+    q4.metric("Couverture période comparable", f"{coverage:.1f} %")
 
-    st.caption(
-        f"Période réellement comparée : {calc.timestamp.min():%d.%m.%Y %H:%M} → "
-        f"{calc.timestamp.max():%d.%m.%Y %H:%M} · environ {compared_days:.1f} jours · "
-        f"{compared_points:,} quarts d'heure.".replace(",", " ")
+    st.info(
+        f"Historique VARIO utilisé : **{calc.timestamp.min():%d.%m.%Y} → "
+        f"{calc.timestamp.max():%d.%m.%Y}** · environ **{compared_days:.0f} jours**. "
+        "Cette période s'allonge automatiquement à mesure que de nouveaux prix VARIO sont publiés."
     )
 
-    if coverage < 95:
+    if coverage < 99:
         st.warning(
-            "L'historique VARIO ne couvre pas tout le fichier client. "
-            "Le résultat ci-dessus porte uniquement sur les quarts d'heure où les deux données existent. "
-            "Il ne doit pas être présenté comme une économie annuelle complète."
+            "Il manque certains quarts d'heure dans la période théoriquement comparable. "
+            "Le résultat est calculé uniquement sur les intervalles réellement disponibles."
         )
 
-    # Monthly comparison.
-    monthly = calc.set_index("timestamp")[["double_cost_chf", "vario_cost_chf"]].resample("MS").sum()
-    monthly.columns = ["Tarif Double", "Tarif VARIO"]
-    st.subheader("Comparaison mensuelle")
-    st.bar_chart(monthly)
+    # Monthly detail
+    monthly = (
+        calc.set_index("timestamp")
+        .assign(
+            energy_kwh=calc.set_index("timestamp")["import_kWh"],
+            expected_slot=1,
+        )
+        .resample("MS")
+        .agg(
+            consommation_kWh=("energy_kwh", "sum"),
+            double_CHF=("double_cost_chf", "sum"),
+            vario_CHF=("vario_cost_chf", "sum"),
+            points=("expected_slot", "sum"),
+        )
+    )
 
-    # Price profile.
+    monthly["economie_CHF"] = monthly["double_CHF"] - monthly["vario_CHF"]
+    monthly["economie_pct"] = (
+        monthly["economie_CHF"] / monthly["double_CHF"].replace(0, pd.NA) * 100
+    )
+
+    # Expected interval count for each calendar month, clipped to the actual comparison window.
+    comp_start = calc["timestamp"].min()
+    comp_end_exclusive = calc["timestamp"].max() + pd.Timedelta(minutes=15)
+
+    expected_counts = []
+    statuses = []
+    for month_start in monthly.index:
+        month_end = month_start + pd.offsets.MonthBegin(1)
+        start_clip = max(month_start, comp_start)
+        end_clip = min(month_end, comp_end_exclusive)
+        expected = max(0, int(round((end_clip - start_clip).total_seconds() / (meta.dt_hours * 3600))))
+        expected_counts.append(expected)
+
+        full_calendar_month = (start_clip == month_start) and (end_clip == month_end)
+        actual = int(monthly.loc[month_start, "points"])
+        cov = actual / expected * 100.0 if expected else 0.0
+
+        if full_calendar_month and cov >= 99.5:
+            statuses.append("Complet")
+        elif cov >= 99.5:
+            statuses.append("Partiel (début/fin période)")
+        else:
+            statuses.append(f"Incomplet ({cov:.1f} %)")
+
+    monthly["points_attendus"] = expected_counts
+    monthly["couverture_pct"] = monthly["points"] / monthly["points_attendus"].replace(0, pd.NA) * 100
+    monthly["statut"] = statuses
+
+    st.subheader("Comparaison mois par mois")
+
+    chart = monthly[["double_CHF", "vario_CHF"]].rename(
+        columns={"double_CHF": "Tarif Double", "vario_CHF": "Tarif VARIO"}
+    )
+    st.bar_chart(chart)
+
+    st.subheader("Économie VARIO par mois")
+    st.bar_chart(monthly[["economie_CHF"]].rename(columns={"economie_CHF": "Économie VARIO (CHF)"}))
+
+    display = monthly[
+        [
+            "consommation_kWh",
+            "double_CHF",
+            "vario_CHF",
+            "economie_CHF",
+            "economie_pct",
+            "couverture_pct",
+            "statut",
+        ]
+    ].copy()
+    display.index = display.index.strftime("%m.%Y")
+    display = display.rename(
+        columns={
+            "consommation_kWh": "Consommation (kWh)",
+            "double_CHF": "Double (CHF)",
+            "vario_CHF": "VARIO (CHF)",
+            "economie_CHF": "Économie (CHF)",
+            "economie_pct": "Économie (%)",
+            "couverture_pct": "Couverture (%)",
+            "statut": "Statut",
+        }
+    )
+    st.dataframe(display.round(2), use_container_width=True)
+
+    st.caption(
+        "« Complet » signifie que tout le mois civil est couvert. "
+        "Le premier mois (décembre 2025) et le mois courant sont normalement indiqués comme partiels."
+    )
+
     prices = calc.set_index("timestamp")[["double_tariff_chf_kwh", "vario_chf_kwh"]] * 100
     prices.columns = ["Double (ct/kWh)", "VARIO (ct/kWh)"]
-    st.subheader("Prix appliqués")
-    st.line_chart(prices)
-
-    # Monthly table with savings.
-    table = monthly.copy()
-    table["Économie VARIO"] = table["Tarif Double"] - table["Tarif VARIO"]
-    table["Économie %"] = (
-        table["Économie VARIO"] / table["Tarif Double"].replace(0, pd.NA) * 100
-    )
-    table.index = table.index.strftime("%m.%Y")
-    st.subheader("Détail mensuel")
-    st.dataframe(table.round(2), use_container_width=True)
+    with st.expander("Voir les prix appliqués"):
+        st.line_chart(prices)
 
     with st.expander("Contrôle quart d'heure"):
         detail = calc[

@@ -27,3 +27,10 @@ streamlit run app.py
 ## Important
 Les prix HT/BT saisis doivent être les prix variables totaux pertinents pour l'année/contrat
 analysé. Les frais fixes identiques aux deux options ne modifient pas l'écart Double vs VARIO.
+
+
+## Version historique automatique
+- L'analyse commence automatiquement au 11.12.2025, début de l'historique VARIO observé.
+- La date de fin est automatiquement aujourd'hui ou la fin du fichier client, selon la première atteinte.
+- Le tableau mensuel distingue les mois complets des mois partiels.
+- Chaque jour, l'analyse peut intégrer automatiquement un jour VARIO supplémentaire.
