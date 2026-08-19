@@ -91,8 +91,13 @@ def optimize_day(
     discharge_efficiency: float = 0.95,
     allow_grid_charge: bool = True,
     min_arbitrage_margin_chf_kwh: float = 0.02,
+    strategy_mode: str = "automatic",
+    buy_min_chf_kwh: float = 0.12,
+    buy_max_chf_kwh: float = 0.30,
+    sell_min_chf_kwh: float = 0.03,
+    sell_max_chf_kwh: float = 0.15,
 ) -> StrategyResult:
-    """Transparent greedy EMS simulation over the 96 quarter-hour slots.
+    """Transparent greedy EMS simulation over quarter-hour slots.
 
     Priority:
     1. Serve load with PV.
@@ -130,8 +135,19 @@ def optimize_day(
         future_high = _future_buy_threshold(slots, i)
         pv_storage_value = future_high * discharge_efficiency - slot.grid_chf_kwh
 
-        # PV surplus first.
-        if surplus_pv > 0 and pv_storage_value >= min_arbitrage_margin_chf_kwh:
+        # PV surplus first. In manual mode, store only while the injection price
+        # is at or below the configured low selling threshold.
+        if strategy_mode == "manual":
+            if slot.grid_chf_kwh <= sell_min_chf_kwh:
+                should_store_pv = True
+            elif slot.grid_chf_kwh >= sell_max_chf_kwh:
+                should_store_pv = False
+            else:
+                should_store_pv = pv_storage_value >= min_arbitrage_margin_chf_kwh
+        else:
+            should_store_pv = pv_storage_value >= min_arbitrage_margin_chf_kwh
+
+        if surplus_pv > 0 and should_store_pv:
             room_input = max(0.0, (soc_max_kwh - stored_kwh) / charge_efficiency)
             charge_input = min(surplus_pv, max_charge_input, room_input)
             stored_kwh += charge_input * charge_efficiency
@@ -141,10 +157,16 @@ def optimize_day(
         # Battery serves load when current price is sufficiently valuable.
         if residual_load > 0:
             available_output = max(0.0, (stored_kwh - soc_min_kwh) * discharge_efficiency)
-            # A simple threshold: use battery if current price is above daily median-ish level.
-            sorted_prices = sorted(s.integrated_chf_kwh for s in slots)
+            # Rolling 24 h threshold, suitable for both one-day and historical simulations.
+            window = slots[max(0, i - 48): min(len(slots), i + 48)]
+            sorted_prices = sorted(s.integrated_chf_kwh for s in window)
             high_price_threshold = sorted_prices[int(0.65 * (len(sorted_prices) - 1))]
-            if slot.integrated_chf_kwh >= high_price_threshold:
+            should_discharge = (
+                slot.integrated_chf_kwh >= buy_max_chf_kwh
+                if strategy_mode == "manual"
+                else slot.integrated_chf_kwh >= high_price_threshold
+            )
+            if should_discharge:
                 discharge_output = min(residual_load, max_discharge_output, available_output)
                 stored_kwh -= discharge_output / discharge_efficiency
                 residual_load -= discharge_output
@@ -155,7 +177,12 @@ def optimize_day(
         if allow_grid_charge and charge_input == 0 and residual_load >= 0:
             effective_charge_cost = slot.integrated_chf_kwh / max(charge_efficiency * discharge_efficiency, 0.01)
             spread = future_high - effective_charge_cost
-            if spread >= min_arbitrage_margin_chf_kwh:
+            should_grid_charge = (
+                slot.integrated_chf_kwh <= buy_min_chf_kwh
+                if strategy_mode == "manual"
+                else spread >= min_arbitrage_margin_chf_kwh
+            )
+            if should_grid_charge:
                 room_input = max(0.0, (soc_max_kwh - stored_kwh) / charge_efficiency)
                 grid_charge = min(max_charge_input, room_input)
                 if grid_charge > 0:
@@ -215,7 +242,7 @@ def optimize_day(
         charged_energy_kwh=round(sum(s.energy_kwh for s in steps if s.action == "charge"), 2),
         discharged_energy_kwh=round(sum(s.energy_kwh for s in steps if s.action == "discharge"), 2),
         final_soc_pct=round(stored_kwh / battery_capacity_kwh * 100, 1),
-        strategy_comment="Simulation énergétique sur 96 pas avec PV, consommation, achat, revente et SOC.",
+        strategy_comment=f"Simulation énergétique sur {len(slots)} pas de 15 minutes avec PV, consommation, achat, revente et SOC.",
     )
 
 

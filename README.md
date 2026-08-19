@@ -1,13 +1,16 @@
-# Soleol EMS VARIO — v4
+# Soleol EMS VARIO — historique + GoodWe
 
-Prototype Streamlit manuel pour :
+Cette version ajoute un mode **Historique Groupe E VARIO** au prototype existant.
 
-- récupérer les 96 tarifs Groupe E VARIO ;
-- créer une prévision PV/consommation théorique ou importer un CSV ;
-- simuler la batterie sur 96 pas de 15 minutes ;
-- comparer le coût sans et avec EMS ;
-- convertir le résultat en fenêtres GoodWe `BatteryCD` ;
-- envoyer manuellement les commandes en mode réel.
+Fonctions principales :
+- tarifs VARIO actuels ou période historique choisie ;
+- pas de 15 minutes ;
+- profil PV/consommation théorique exprimé en kWh/jour sur les backtests ;
+- import CSV réel `timestamp,pv_kwh,load_kwh` ;
+- simulation batterie sur toute la période ;
+- coût sans EMS / avec EMS / gain total et moyen journalier ;
+- résumé journalier ;
+- envoi GoodWe désactivé automatiquement en mode historique.
 
 ## Lancer
 
@@ -16,25 +19,22 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## CSV de prévision
+## Remarque
 
-Colonnes obligatoires :
+L'API Groupe E a renvoyé dans les tests un historique continu à partir du 11.12.2025. Si une date antérieure est demandée, l'application affichera simplement les créneaux réellement retournés par l'API.
 
-```text
-timestamp,pv_kwh,load_kwh
-2026-07-09T00:00:00+02:00,0,0.8
-```
+## Strategie tarifaire
 
-Une ligne par quart d'heure, alignée sur les tarifs Groupe E.
+Deux modes sont disponibles :
 
-## GoodWe
+- **Automatique VARIO** : logique d'arbitrage automatique selon les prix futurs et la marge minimale.
+- **Seuils manuels** : quatre seuils visibles en ct/kWh : achat minimum, achat maximum, vente minimum et vente maximum.
 
-Créer un fichier `.env` local :
+En mode manuel :
+- charge reseau lorsque le prix d'achat est inferieur ou egal au seuil achat minimum ;
+- decharge pour alimenter la charge lorsque le prix d'achat est superieur ou egal au seuil achat maximum ;
+- stockage prioritaire du surplus PV lorsque le prix de vente est inferieur ou egal au seuil vente minimum ;
+- injection prioritaire lorsque le prix de vente est superieur ou egal au seuil vente maximum ;
+- entre les seuils de vente, la logique d'arbitrage automatique reste utilisee.
 
-```env
-GOODWE_BASE_URL=https://openapi.goodwe.com
-GOODWE_AUTHORIZATION=Bearer ...
-GOODWE_APP_IDENTIFIER=...
-```
-
-Le mode test est activé par défaut. Vérifier les noms exacts des champs GoodWe sur une installation pilote avant tout envoi réel.
+L'ecran principal affiche egalement les prix d'achat et de vente minimum/maximum observes sur la periode analysee, en ct/kWh.
