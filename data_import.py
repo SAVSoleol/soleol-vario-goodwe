@@ -26,13 +26,35 @@ def read_csv_flexible(raw: bytes) -> pd.DataFrame:
     raise ValueError("Impossible de lire le CSV. Vérifie le séparateur et l'encodage.")
 
 
+def excel_sheet_names(raw: bytes) -> list[str]:
+    book = pd.ExcelFile(io.BytesIO(raw))
+    return list(book.sheet_names)
+
+
+def read_excel_flexible(raw: bytes, sheet_name: str | int = 0) -> pd.DataFrame:
+    try:
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=sheet_name)
+    except Exception as exc:
+        raise ValueError(f"Impossible de lire le fichier Excel : {exc}") from exc
+    if df is None or len(df.columns) < 2:
+        raise ValueError("La feuille Excel doit contenir au moins deux colonnes.")
+    return df
+
+
+def read_profile_file(raw: bytes, filename: str, sheet_name: str | int = 0) -> pd.DataFrame:
+    lower = filename.lower()
+    if lower.endswith((".xlsx", ".xls")):
+        return read_excel_flexible(raw, sheet_name=sheet_name)
+    return read_csv_flexible(raw)
+
+
 def prepare_consumption(
     df: pd.DataFrame,
     *,
     timestamp_col: str,
     value_col: str,
     unit: str,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, float]:
     data = df[[timestamp_col, value_col]].copy()
     data.columns = ["timestamp", "value"]
 
@@ -40,7 +62,7 @@ def prepare_consumption(
     data["value"] = pd.to_numeric(data["value"], errors="coerce")
     data = data.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
     if data.empty:
-        raise ValueError("Aucune ligne valide après lecture du timestamp et de la consommation.")
+        raise ValueError("Aucune ligne valide après lecture de la date/heure et de la valeur.")
 
     # Localize naive timestamps to Switzerland; convert aware timestamps to Switzerland.
     if data["timestamp"].dt.tz is None:
@@ -52,7 +74,7 @@ def prepare_consumption(
 
     data = data.drop_duplicates(subset=["timestamp"], keep="last")
 
-    # Determine representative time step for power-to-energy conversions.
+    # Representative original time step, used to convert power (kW/W) into energy (kWh).
     diffs_h = data["timestamp"].diff().dt.total_seconds().dropna() / 3600.0
     step_h = float(diffs_h.median()) if not diffs_h.empty else 0.25
     if step_h <= 0 or step_h > 24:
@@ -70,11 +92,12 @@ def prepare_consumption(
         raise ValueError(f"Unité inconnue : {unit}")
 
     data = data[data["consumption_kwh"] >= 0].copy()
-    # The tariff API is quarter-hourly. Aggregate onto the same 15-min grid.
+
+    # Groupe E VARIO is quarter-hourly. Align the client data to the same grid.
     data = (
         data.set_index("timestamp")[["consumption_kwh"]]
         .resample("15min")
         .sum()
         .reset_index()
     )
-    return data
+    return data, step_h
