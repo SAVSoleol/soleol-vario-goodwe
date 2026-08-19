@@ -96,6 +96,7 @@ def optimize_day(
     buy_max_chf_kwh: float = 0.30,
     sell_min_chf_kwh: float = 0.03,
     sell_max_chf_kwh: float = 0.15,
+    feed_in_chf_kwh: float = 0.08,
 ) -> StrategyResult:
     """Transparent greedy EMS simulation over quarter-hour slots.
 
@@ -133,17 +134,15 @@ def optimize_day(
         source: Source = "none"
 
         future_high = _future_buy_threshold(slots, i)
-        pv_storage_value = future_high * discharge_efficiency - slot.grid_chf_kwh
+        pv_storage_value = future_high * discharge_efficiency - feed_in_chf_kwh
 
         # PV surplus first. In manual mode, store only while the injection price
         # is at or below the configured low selling threshold.
         if strategy_mode == "manual":
-            if slot.grid_chf_kwh <= sell_min_chf_kwh:
-                should_store_pv = True
-            elif slot.grid_chf_kwh >= sell_max_chf_kwh:
-                should_store_pv = False
-            else:
-                should_store_pv = pv_storage_value >= min_arbitrage_margin_chf_kwh
+            # Injection remuneration is independent from the VARIO grid component.
+            # In manual mode, the buy thresholds control grid arbitrage; PV storage
+            # remains based on avoided future purchase versus fixed feed-in value.
+            should_store_pv = pv_storage_value >= min_arbitrage_margin_chf_kwh
         else:
             should_store_pv = pv_storage_value >= min_arbitrage_margin_chf_kwh
 
@@ -194,7 +193,7 @@ def optimize_day(
         grid_import += max(0.0, residual_load)
         grid_export += max(0.0, surplus_pv)
 
-        slot_cost = grid_import * slot.integrated_chf_kwh - grid_export * slot.grid_chf_kwh
+        slot_cost = grid_import * slot.integrated_chf_kwh - grid_export * feed_in_chf_kwh
         optimized_cost += slot_cost
         soc_after = stored_kwh / battery_capacity_kwh * 100
 
@@ -225,7 +224,7 @@ def optimize_day(
                 grid_import_kwh=round(grid_import, 4),
                 grid_export_kwh=round(grid_export, 4),
                 buy_price_chf_kwh=slot.integrated_chf_kwh,
-                sell_price_chf_kwh=slot.grid_chf_kwh,
+                sell_price_chf_kwh=feed_in_chf_kwh,
                 source=source,
                 cost_chf=round(slot_cost, 5),
             )

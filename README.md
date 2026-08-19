@@ -1,16 +1,33 @@
-# Soleol EMS VARIO — historique + GoodWe
+# Soleol — Comparateur Groupe E Double vs VARIO + batterie
 
-Cette version ajoute un mode **Historique Groupe E VARIO** au prototype existant.
+Cette version répond en priorité à la question commerciale : **combien un client aurait-il payé avec le tarif Double et combien avec VARIO pour exactement le même profil de consommation ?**
 
-Fonctions principales :
-- tarifs VARIO actuels ou période historique choisie ;
-- pas de 15 minutes ;
-- profil PV/consommation théorique exprimé en kWh/jour sur les backtests ;
-- import CSV réel `timestamp,pv_kwh,load_kwh` ;
-- simulation batterie sur toute la période ;
-- coût sans EMS / avec EMS / gain total et moyen journalier ;
-- résumé journalier ;
-- envoi GoodWe désactivé automatiquement en mode historique.
+Elle affiche trois scénarios :
+
+1. Tarif Double sans batterie
+2. Tarif VARIO sans batterie
+3. Tarif VARIO + batterie optimisée
+
+## Données nécessaires
+
+Le meilleur résultat est obtenu avec un CSV au pas de 15 minutes :
+
+```text
+timestamp,pv_kwh,load_kwh
+2026-01-01T00:00:00+01:00,0.0,0.8
+```
+
+Sans CSV, un profil théorique journalier peut être utilisé pour tester l'interface.
+
+## Paramètres tarifaires
+
+Les plages horaires Double 2026 sont :
+- haut tarif : 07:00–12:00 et 17:00–23:00
+- bas tarif : 12:00–17:00 et 23:00–07:00
+
+Les montants HT/BT sont **modifiables dans l'interface**. Les valeurs par défaut du prototype sont 31 et 21 ct/kWh et doivent être adaptées au produit/client si nécessaire.
+
+Le champ `grid` de l'API Groupe E VARIO représente la composante réseau dynamique. Il ne s'agit pas du prix de reprise PV. Le prix d'injection est donc un paramètre séparé.
 
 ## Lancer
 
@@ -19,22 +36,4 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Remarque
-
-L'API Groupe E a renvoyé dans les tests un historique continu à partir du 11.12.2025. Si une date antérieure est demandée, l'application affichera simplement les créneaux réellement retournés par l'API.
-
-## Strategie tarifaire
-
-Deux modes sont disponibles :
-
-- **Automatique VARIO** : logique d'arbitrage automatique selon les prix futurs et la marge minimale.
-- **Seuils manuels** : quatre seuils visibles en ct/kWh : achat minimum, achat maximum, vente minimum et vente maximum.
-
-En mode manuel :
-- charge reseau lorsque le prix d'achat est inferieur ou egal au seuil achat minimum ;
-- decharge pour alimenter la charge lorsque le prix d'achat est superieur ou egal au seuil achat maximum ;
-- stockage prioritaire du surplus PV lorsque le prix de vente est inferieur ou egal au seuil vente minimum ;
-- injection prioritaire lorsque le prix de vente est superieur ou egal au seuil vente maximum ;
-- entre les seuils de vente, la logique d'arbitrage automatique reste utilisee.
-
-L'ecran principal affiche egalement les prix d'achat et de vente minimum/maximum observes sur la periode analysee, en ct/kWh.
+Le mode historique désactive tout envoi de commande GoodWe.
