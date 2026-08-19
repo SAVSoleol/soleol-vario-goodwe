@@ -1,0 +1,215 @@
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from billing import compare_double_vario
+from groupe_e_api import fetch_vario
+from meter_loader import UnsupportedFormatError, load_consumption_file
+
+st.set_page_config(page_title="Soleol — Double vs VARIO", layout="wide")
+
+st.markdown("""
+<style>
+.block-container {max-width: 1450px; padding-top: 2rem;}
+.result-card {
+    border: 1px solid rgba(148,163,184,.22);
+    border-radius: 16px;
+    padding: 20px 24px;
+    background: rgba(15,23,42,.32);
+}
+.big-result {
+    font-size: 2.4rem;
+    font-weight: 800;
+    margin-top: .2rem;
+}
+.muted {color:#94a3b8;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Analyse tarifaire Groupe E")
+st.caption("Question : combien ce client aurait-il économisé avec VARIO plutôt qu'avec le tarif Double ?")
+
+with st.sidebar:
+    st.header("1. Client")
+    client = st.text_input("Client / site", value="")
+    uploaded = st.file_uploader(
+        "Courbe de soutirage réseau",
+        type=["xlsx", "xls", "csv"],
+        help="Le programme détecte automatiquement les colonnes, l'unité et le pas de temps.",
+    )
+
+    st.header("2. Tarif Double")
+    st.caption("Prix totaux variables à comparer au prix VARIO intégré. Frais fixes identiques exclus.")
+    ht_ct = st.number_input("Haut tarif (ct/kWh)", min_value=0.0, value=29.32, step=0.01, format="%.2f")
+    bt_ct = st.number_input("Bas tarif (ct/kWh)", min_value=0.0, value=19.27, step=0.01, format="%.2f")
+    st.caption("HT : 07h–12h et 17h–23h. BT : le reste.")
+    vat = st.toggle("Ajouter TVA 8.1 % aux deux scénarios", value=False)
+
+    with st.expander("Options avancées"):
+        unit = st.selectbox("Forcer l'unité", ["auto", "kW", "kWh", "W", "Wh"], index=0)
+        st.caption("Laisser « auto » dans la grande majorité des cas.")
+
+if uploaded is None:
+    st.info("Importe la courbe de soutirage réseau du client pour lancer l'analyse.")
+    st.stop()
+
+@st.cache_data(show_spinner=False)
+def load_cached(name: str, raw: bytes, unit: str):
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / name
+        p.write_bytes(raw)
+        return load_consumption_file(p, forced_unit=unit)
+
+try:
+    load_df, meta = load_cached(uploaded.name, uploaded.getvalue(), unit)
+except Exception as exc:
+    st.error(f"Fichier non reconnu : {exc}")
+    st.stop()
+
+st.success(
+    f"Fichier reconnu automatiquement : {meta.vendor} · "
+    f"{meta.n_rows:,} mesures · pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}"
+)
+with st.expander("Détails de détection"):
+    st.write(f"**Colonne date/heure :** {meta.date_column}")
+    st.write(f"**Colonne soutirage :** {meta.import_column}")
+    st.write(f"**Convention horodatage :** {meta.timestamp_convention}")
+    st.write(
+        f"**Période du fichier :** {load_df.timestamp.min():%d.%m.%Y %H:%M} → "
+        f"{load_df.timestamp.max():%d.%m.%Y %H:%M}"
+    )
+    st.write(f"**Soutirage total du fichier :** {load_df.import_kWh.sum():,.0f} kWh".replace(",", " "))
+
+# Give a small visual confirmation before API call.
+preview = load_df.head(8).copy()
+preview["timestamp"] = preview["timestamp"].dt.strftime("%d.%m.%Y %H:%M")
+with st.expander("Aperçu des mesures"):
+    st.dataframe(preview, use_container_width=True, hide_index=True)
+
+if st.button("Comparer Double vs VARIO", type="primary"):
+    start = load_df["timestamp"].min().floor("15min")
+    end = load_df["timestamp"].max().ceil("15min") + pd.Timedelta(minutes=15)
+
+    with st.spinner("Récupération de l'historique VARIO Groupe E..."):
+        try:
+            vario, publication = fetch_vario(start, end)
+        except Exception as exc:
+            st.error(f"API Groupe E : {exc}")
+            st.stop()
+
+    if vario.empty:
+        st.error("Aucun prix VARIO n'est disponible pour la période de ce fichier.")
+        st.stop()
+
+    # Merge strictly on quarter-hour start labels.
+    data = load_df.copy()
+    data["timestamp"] = data["timestamp"].dt.floor("15min")
+    merged = data.merge(vario, on="timestamp", how="inner")
+
+    if merged.empty:
+        st.error("Aucun quart d'heure commun entre le profil client et les prix VARIO disponibles.")
+        st.stop()
+
+    calc, r = compare_double_vario(
+        merged,
+        ht_chf_kwh=ht_ct / 100.0,
+        bt_chf_kwh=bt_ct / 100.0,
+        periods=((7.0, 12.0), (17.0, 23.0)),
+        weekend_low=False,
+        vat_factor=1.081 if vat else 1.0,
+    )
+
+    file_points = len(data)
+    compared_points = len(calc)
+    coverage = compared_points / file_points * 100.0 if file_points else 0.0
+    compared_days = compared_points * meta.dt_hours / 24.0
+
+    st.subheader("Résultat")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Tarif Double", f"{r['double_chf']:,.2f} CHF".replace(",", " "))
+    c2.metric("Tarif VARIO", f"{r['vario_chf']:,.2f} CHF".replace(",", " "))
+    c3.metric(
+        "Économie VARIO",
+        f"{r['saving_chf']:,.2f} CHF".replace(",", " "),
+        f"{r['saving_pct']:+.1f} %",
+    )
+
+    if r["saving_chf"] >= 0:
+        st.success(
+            f"Sur la période réellement comparable, "
+            f"**{client or 'ce client'} aurait économisé {r['saving_chf']:,.2f} CHF "
+            f"({r['saving_pct']:.1f} %) avec VARIO**.".replace(",", " ")
+        )
+    else:
+        st.warning(
+            f"Sur la période réellement comparable, "
+            f"**VARIO aurait coûté {abs(r['saving_chf']):,.2f} CHF de plus "
+            f"({abs(r['saving_pct']):.1f} %) à {client or 'ce client'}**.".replace(",", " ")
+        )
+
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Consommation comparée", f"{r['energy_kwh']:,.0f} kWh".replace(",", " "))
+    q2.metric("Prix moyen Double", f"{r['avg_double_chf_kwh']*100:.2f} ct/kWh")
+    q3.metric("Prix moyen VARIO", f"{r['avg_vario_chf_kwh']*100:.2f} ct/kWh")
+    q4.metric("Couverture du fichier", f"{coverage:.1f} %")
+
+    st.caption(
+        f"Période réellement comparée : {calc.timestamp.min():%d.%m.%Y %H:%M} → "
+        f"{calc.timestamp.max():%d.%m.%Y %H:%M} · environ {compared_days:.1f} jours · "
+        f"{compared_points:,} quarts d'heure.".replace(",", " ")
+    )
+
+    if coverage < 95:
+        st.warning(
+            "L'historique VARIO ne couvre pas tout le fichier client. "
+            "Le résultat ci-dessus porte uniquement sur les quarts d'heure où les deux données existent. "
+            "Il ne doit pas être présenté comme une économie annuelle complète."
+        )
+
+    # Monthly comparison.
+    monthly = calc.set_index("timestamp")[["double_cost_chf", "vario_cost_chf"]].resample("MS").sum()
+    monthly.columns = ["Tarif Double", "Tarif VARIO"]
+    st.subheader("Comparaison mensuelle")
+    st.bar_chart(monthly)
+
+    # Price profile.
+    prices = calc.set_index("timestamp")[["double_tariff_chf_kwh", "vario_chf_kwh"]] * 100
+    prices.columns = ["Double (ct/kWh)", "VARIO (ct/kWh)"]
+    st.subheader("Prix appliqués")
+    st.line_chart(prices)
+
+    # Monthly table with savings.
+    table = monthly.copy()
+    table["Économie VARIO"] = table["Tarif Double"] - table["Tarif VARIO"]
+    table["Économie %"] = (
+        table["Économie VARIO"] / table["Tarif Double"].replace(0, pd.NA) * 100
+    )
+    table.index = table.index.strftime("%m.%Y")
+    st.subheader("Détail mensuel")
+    st.dataframe(table.round(2), use_container_width=True)
+
+    with st.expander("Contrôle quart d'heure"):
+        detail = calc[
+            [
+                "timestamp",
+                "import_kWh",
+                "double_tariff_chf_kwh",
+                "vario_chf_kwh",
+                "double_cost_chf",
+                "vario_cost_chf",
+            ]
+        ].copy()
+        detail["double_tariff_chf_kwh"] *= 100
+        detail["vario_chf_kwh"] *= 100
+        detail = detail.rename(
+            columns={
+                "double_tariff_chf_kwh": "Double ct/kWh",
+                "vario_chf_kwh": "VARIO ct/kWh",
+            }
+        )
+        st.dataframe(detail, use_container_width=True, height=420, hide_index=True)
