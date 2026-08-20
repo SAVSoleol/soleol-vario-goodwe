@@ -25,6 +25,8 @@ st.markdown("""
 .kpi-blue .kpi-label,.kpi-blue .kpi-sub{color:#93c5fd}
 .kpi-green{background:linear-gradient(100deg,rgba(20,83,45,.38),rgba(5,46,22,.20));border-color:rgba(34,197,94,.45)}
 .kpi-green .kpi-label,.kpi-green .kpi-sub{color:#86efac}
+.kpi-purple{background:linear-gradient(100deg,rgba(88,28,135,.42),rgba(59,7,100,.22));border-color:rgba(168,85,247,.55)}
+.kpi-purple .kpi-label,.kpi-purple .kpi-sub{color:#d8b4fe}
 .vario-help{color:#a1a1aa;font-size:.86rem;margin:-5px 0 14px}
 .vario-box{border:1px solid rgba(234,179,8,.45);background:rgba(113,63,18,.13);border-radius:12px;padding:16px 18px;margin-bottom:16px}
 .vario-box b{color:#facc15}
@@ -108,6 +110,9 @@ if not original_df.empty:
     ht_share = ht_kwh / total_double_kwh * 100.0 if total_double_kwh > 0 else 0.0
     bt_share = bt_kwh / total_double_kwh * 100.0 if total_double_kwh > 0 else 0.0
 
+    export_total_kwh = float(original_df["export_kWh"].sum()) if "export_kWh" in original_df.columns else 0.0
+    export_revenue_chf = export_total_kwh * feed_in_ct / 100.0
+
     profile_year = int(original_df["timestamp"].dt.year.mode().iloc[0])
 
     st.subheader(f"Répartition de la consommation {profile_year} — Tarif Double")
@@ -148,6 +153,16 @@ if not original_df.empty:
             <div class="kpi-label">Coût total au tarif Double</div>
             <div class="kpi-value">{total_double_cost:,.2f} CHF</div>
             <div class="kpi-sub">HT + BT, hors frais fixes</div>
+          </div>
+          <div class="kpi-card kpi-purple">
+            <div class="kpi-label">Export total (réseau)</div>
+            <div class="kpi-value">{export_total_kwh:,.0f} kWh</div>
+            <div class="kpi-sub">Énergie injectée sur la période</div>
+          </div>
+          <div class="kpi-card kpi-purple">
+            <div class="kpi-label">Revenus d’injection (reprise PV)</div>
+            <div class="kpi-value">{export_revenue_chf:,.2f} CHF</div>
+            <div class="kpi-sub">{feed_in_ct:.2f} ct/kWh</div>
           </div>
         </div>
         """.replace(",", " "),
