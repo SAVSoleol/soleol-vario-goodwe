@@ -44,6 +44,11 @@ with st.sidebar:
         type=["xlsx", "xls", "csv"],
         help="Le programme détecte automatiquement les colonnes, l'unité et le pas de temps.",
     )
+    transpose_to_2026 = st.toggle(
+        "Utiliser un profil 2025 comme profil 2026",
+        value=True,
+        help="Conserve les valeurs mesurées et remplace uniquement l'année 2025 par 2026.",
+    )
 
     st.header("2. Tarif Double")
     st.caption("Prix variables à comparer au prix VARIO intégré. Frais fixes identiques exclus.")
@@ -73,19 +78,38 @@ except Exception as exc:
     st.error(f"Fichier non reconnu : {exc}")
     st.stop()
 
+original_start = load_df["timestamp"].min()
+original_end = load_df["timestamp"].max()
+profile_transposed = False
+if transpose_to_2026 and original_start.year == 2025:
+    load_df = load_df.copy()
+    load_df["timestamp"] = load_df["timestamp"].map(lambda x: x.replace(year=2026))
+    profile_transposed = True
+
 st.success(
     f"Fichier reconnu automatiquement : {meta.vendor} · "
     f"{meta.n_rows:,} mesures · pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}"
 )
 
+if profile_transposed:
+    st.warning(
+        "MODE SIMULATION — Profil de charge 2025 transposé sur 2026. "
+        "Les consommations restent identiques ; seules les dates passent en 2026. "
+        "Les prix VARIO sont les prix réels 2026 disponibles."
+    )
+
 with st.expander("Détails de détection"):
     st.write(f"**Colonne date/heure :** {meta.date_column}")
     st.write(f"**Colonne soutirage :** {meta.import_column}")
     st.write(f"**Convention horodatage :** {meta.timestamp_convention}")
-    st.write(
-        f"**Période du fichier :** {load_df.timestamp.min():%d.%m.%Y %H:%M} → "
-        f"{load_df.timestamp.max():%d.%m.%Y %H:%M}"
-    )
+    if profile_transposed:
+        st.write(f"**Période originale :** {original_start:%d.%m.%Y %H:%M} → {original_end:%d.%m.%Y %H:%M}")
+        st.write(f"**Période simulée :** {load_df.timestamp.min():%d.%m.%Y %H:%M} → {load_df.timestamp.max():%d.%m.%Y %H:%M}")
+    else:
+        st.write(
+            f"**Période du fichier :** {load_df.timestamp.min():%d.%m.%Y %H:%M} → "
+            f"{load_df.timestamp.max():%d.%m.%Y %H:%M}"
+        )
     st.write(f"**Soutirage total du fichier :** {load_df.import_kWh.sum():,.0f} kWh".replace(",", " "))
 
 preview = load_df.head(8).copy()
@@ -183,6 +207,9 @@ if st.button("Comparer Double vs VARIO", type="primary"):
         f"{calc.timestamp.max():%d.%m.%Y}** · environ **{compared_days:.0f} jours**. "
         "Cette période s'allonge automatiquement à mesure que de nouveaux prix VARIO sont publiés."
     )
+
+    if profile_transposed:
+        st.caption("Hypothèse : le comportement de consommation en 2026 est supposé identique au profil mesuré en 2025.")
 
     if coverage < 99:
         st.warning(
