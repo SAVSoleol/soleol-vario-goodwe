@@ -11,6 +11,25 @@ from battery_opt import optimize_battery, double_price_vector
 from report_vario import generate_vario_report
 
 st.set_page_config(page_title="Soleol — Analyse VARIO", layout="wide")
+
+st.markdown("""
+<style>
+.kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0 20px}
+.kpi-card{border-radius:12px;padding:18px 22px;border:1px solid;min-height:92px}
+.kpi-label{font-size:.86rem;font-weight:750;margin-bottom:8px}
+.kpi-value{font-size:1.65rem;font-weight:850;line-height:1.05}
+.kpi-sub{font-size:.78rem;margin-top:8px;font-weight:700}
+.kpi-red{background:linear-gradient(100deg,rgba(127,29,29,.42),rgba(69,10,10,.20));border-color:rgba(239,68,68,.55)}
+.kpi-red .kpi-label,.kpi-red .kpi-sub{color:#fca5a5}
+.kpi-blue{background:linear-gradient(100deg,rgba(30,64,175,.35),rgba(7,32,63,.22));border-color:rgba(59,130,246,.55)}
+.kpi-blue .kpi-label,.kpi-blue .kpi-sub{color:#93c5fd}
+.kpi-green{background:linear-gradient(100deg,rgba(20,83,45,.38),rgba(5,46,22,.20));border-color:rgba(34,197,94,.45)}
+.kpi-green .kpi-label,.kpi-green .kpi-sub{color:#86efac}
+.vario-help{color:#a1a1aa;font-size:.86rem;margin:-5px 0 14px}
+.vario-box{border:1px solid rgba(234,179,8,.45);background:rgba(113,63,18,.13);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+.vario-box b{color:#facc15}
+</style>
+""", unsafe_allow_html=True)
 VARIO_HISTORY_START = pd.Timestamp("2025-12-11 00:00:00")
 MONTHS_FR = {1:"Janvier",2:"Février",3:"Mars",4:"Avril",5:"Mai",6:"Juin",7:"Juillet",8:"Août",9:"Septembre",10:"Octobre",11:"Novembre",12:"Décembre"}
 
@@ -97,25 +116,43 @@ if not original_df.empty:
         f"({ht_ct:.2f} ct/kWh HT et {bt_ct:.2f} ct/kWh BT)."
     )
 
-    h1, h2, h3, h4 = st.columns(4)
-    h1.metric("Haut tarif — consommation", f"{ht_kwh:,.0f} kWh".replace(",", " "), f"{ht_share:.1f} %")
-    h2.metric("Haut tarif — coût", f"{ht_cost:,.2f} CHF".replace(",", " "))
-    h3.metric("Bas tarif — consommation", f"{bt_kwh:,.0f} kWh".replace(",", " "), f"{bt_share:.1f} %")
-    h4.metric("Bas tarif — coût", f"{bt_cost:,.2f} CHF".replace(",", " "))
-
-    t1, t2 = st.columns(2)
-    t1.metric("Soutirage total", f"{total_double_kwh:,.0f} kWh".replace(",", " "))
-    t2.metric("Coût énergie Double calculé", f"{total_double_cost:,.2f} CHF".replace(",", " "))
-
-    with st.expander("Voir la répartition HT / BT"):
-        repartition = pd.DataFrame(
-            {
-                "Consommation (kWh)": [ht_kwh, bt_kwh],
-                "Coût (CHF)": [ht_cost, bt_cost],
-            },
-            index=["Haut tarif", "Bas tarif"],
-        )
-        st.bar_chart(repartition[["Consommation (kWh)"]])
+    st.markdown(
+        f"""
+        <div class="kpi-grid">
+          <div class="kpi-card kpi-red">
+            <div class="kpi-label">Consommation haut tarif (HT)</div>
+            <div class="kpi-value">{ht_kwh:,.0f} kWh</div>
+            <div class="kpi-sub">{ht_share:.1f} % du soutirage</div>
+          </div>
+          <div class="kpi-card kpi-red">
+            <div class="kpi-label">Coût haut tarif (HT)</div>
+            <div class="kpi-value">{ht_cost:,.2f} CHF</div>
+            <div class="kpi-sub">{ht_ct:.2f} ct/kWh</div>
+          </div>
+          <div class="kpi-card kpi-blue">
+            <div class="kpi-label">Consommation bas tarif (BT)</div>
+            <div class="kpi-value">{bt_kwh:,.0f} kWh</div>
+            <div class="kpi-sub">{bt_share:.1f} % du soutirage</div>
+          </div>
+          <div class="kpi-card kpi-blue">
+            <div class="kpi-label">Coût bas tarif (BT)</div>
+            <div class="kpi-value">{bt_cost:,.2f} CHF</div>
+            <div class="kpi-sub">{bt_ct:.2f} ct/kWh</div>
+          </div>
+          <div class="kpi-card kpi-green">
+            <div class="kpi-label">Consommation totale</div>
+            <div class="kpi-value">{total_double_kwh:,.0f} kWh</div>
+            <div class="kpi-sub">HT + BT</div>
+          </div>
+          <div class="kpi-card kpi-green">
+            <div class="kpi-label">Coût total au tarif Double</div>
+            <div class="kpi-value">{total_double_cost:,.2f} CHF</div>
+            <div class="kpi-sub">HT + BT, hors frais fixes</div>
+          </div>
+        </div>
+        """.replace(",", " "),
+        unsafe_allow_html=True,
+    )
 
 if st.button("Lancer l'analyse", type="primary"):
     today = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
@@ -164,11 +201,17 @@ if st.button("Lancer l'analyse", type="primary"):
     annual_factor = 365/period_days if period_days else 0
 
     st.subheader("1. VARIO seul est-il intéressant ?")
+    st.markdown(
+        '<div class="vario-help"><b>Tarif Double</b> = votre tarif de référence avec heures HT/BT. '
+        '<b>VARIO</b> = le même soutirage du client, sans batterie, mais facturé avec le prix dynamique '
+        'Groupe E de chaque quart d’heure.</div>',
+        unsafe_allow_html=True,
+    )
     gain_vario = double_cost-vario_cost
     c1,c2,c3 = st.columns(3)
-    c1.metric("Double", f"{double_cost:,.2f} CHF".replace(","," "))
-    c2.metric("VARIO", f"{vario_cost:,.2f} CHF".replace(","," "))
-    c3.metric("Gain VARIO seul", f"{gain_vario:,.2f} CHF".replace(","," "), f"{(gain_vario/double_cost*100 if double_cost else 0):+.1f} %")
+    c1.metric("Tarif Double (HT / BT)", f"{double_cost:,.2f} CHF".replace(","," "))
+    c2.metric("Tarif VARIO (sans batterie)", f"{vario_cost:,.2f} CHF".replace(","," "))
+    c3.metric("Économie en passant à VARIO", f"{gain_vario:,.2f} CHF".replace(","," "), f"{(gain_vario/double_cost*100 if double_cost else 0):+.1f} %")
 
     st.subheader("2. Que rapporte une batterie chargée avec le surplus PV ?")
     gross_pv = vario_cost-vario_pv.cost_chf
