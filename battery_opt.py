@@ -113,9 +113,40 @@ def optimize_battery(
 
     # Bounds
     bounds = []
-    # grid import/export: no artificial upper bound
-    bounds.extend([(0.0, None)] * n)
-    bounds.extend([(0.0, None)] * n)
+
+    # IMPORTANT:
+    # Grid import/export must be physically bounded. Without these bounds the LP
+    # can buy and sell an unlimited amount in the same quarter-hour whenever
+    # the feed-in price is higher than the purchase price, which makes the
+    # mathematical problem "unbounded".
+    #
+    # Import can cover the measured site import plus at most one battery
+    # charging step. In PV-only mode no extra grid import is allowed.
+    if allow_grid_charge:
+        bounds.extend([
+            # Grid charging is only permitted when there is no simultaneous
+            # measured PV export. With a single point of connection, importing
+            # energy to charge while preserving an export in the same interval
+            # would be an artificial simultaneous buy/sell transaction.
+            (
+                0.0,
+                max(0.0, float(imp0[i])) + (p_step if float(exp0[i]) <= 1e-12 else 0.0)
+            )
+            for i in range(n)
+        ])
+    else:
+        bounds.extend([
+            (0.0, max(0.0, float(imp0[i])))
+            for i in range(n)
+        ])
+
+    # The battery is used for self-consumption / import avoidance, not for
+    # exporting stored energy to the grid. Therefore post-battery export can
+    # never exceed the site's original PV surplus for that interval.
+    bounds.extend([
+        (0.0, max(0.0, float(exp0[i])))
+        for i in range(n)
+    ])
 
     # Charge:
     # PV-only mode limits battery input to measured surplus available in that interval.
