@@ -61,6 +61,7 @@ except Exception as exc:
     st.error(f"Fichier non reconnu : {exc}")
     st.stop()
 
+original_df = df.copy()
 original_start = df.timestamp.min()
 profile_transposed = False
 if transpose_to_2026 and original_start.year == 2025:
@@ -71,6 +72,50 @@ if transpose_to_2026 and original_start.year == 2025:
 st.success(f"Fichier reconnu : {meta.vendor} · {meta.n_rows:,} mesures · pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}")
 if profile_transposed:
     st.warning("MODE SIMULATION — Profil 2025 transposé sur 2026 ; prix VARIO réels 2026.")
+
+if not original_df.empty:
+    original_prices = double_price_vector(original_df["timestamp"], ht_ct/100, bt_ct/100)
+    ht_mask = abs(original_prices - ht_ct/100) < 1e-12
+    bt_mask = ~ht_mask
+
+    ht_kwh = float(original_df.loc[ht_mask, "import_kWh"].sum())
+    bt_kwh = float(original_df.loc[bt_mask, "import_kWh"].sum())
+    total_double_kwh = ht_kwh + bt_kwh
+
+    ht_cost = ht_kwh * ht_ct / 100.0
+    bt_cost = bt_kwh * bt_ct / 100.0
+    total_double_cost = ht_cost + bt_cost
+
+    ht_share = ht_kwh / total_double_kwh * 100.0 if total_double_kwh > 0 else 0.0
+    bt_share = bt_kwh / total_double_kwh * 100.0 if total_double_kwh > 0 else 0.0
+
+    profile_year = int(original_df["timestamp"].dt.year.mode().iloc[0])
+
+    st.subheader(f"Répartition de la consommation {profile_year} — Tarif Double")
+    st.caption(
+        f"Calcul sur le soutirage réseau du profil original avec les tarifs saisis "
+        f"({ht_ct:.2f} ct/kWh HT et {bt_ct:.2f} ct/kWh BT)."
+    )
+
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Haut tarif — consommation", f"{ht_kwh:,.0f} kWh".replace(",", " "), f"{ht_share:.1f} %")
+    h2.metric("Haut tarif — coût", f"{ht_cost:,.2f} CHF".replace(",", " "))
+    h3.metric("Bas tarif — consommation", f"{bt_kwh:,.0f} kWh".replace(",", " "), f"{bt_share:.1f} %")
+    h4.metric("Bas tarif — coût", f"{bt_cost:,.2f} CHF".replace(",", " "))
+
+    t1, t2 = st.columns(2)
+    t1.metric("Soutirage total", f"{total_double_kwh:,.0f} kWh".replace(",", " "))
+    t2.metric("Coût énergie Double calculé", f"{total_double_cost:,.2f} CHF".replace(",", " "))
+
+    with st.expander("Voir la répartition HT / BT"):
+        repartition = pd.DataFrame(
+            {
+                "Consommation (kWh)": [ht_kwh, bt_kwh],
+                "Coût (CHF)": [ht_cost, bt_cost],
+            },
+            index=["Haut tarif", "Bas tarif"],
+        )
+        st.bar_chart(repartition[["Consommation (kWh)"]])
 
 if st.button("Lancer l'analyse", type="primary"):
     today = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
