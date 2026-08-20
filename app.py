@@ -8,6 +8,7 @@ from billing import compare_double_vario
 from groupe_e_api import fetch_vario
 from meter_loader import load_consumption_file
 from battery_opt import optimize_battery, double_price_vector
+from report_vario import generate_vario_report
 
 st.set_page_config(page_title="Soleol — Analyse VARIO", layout="wide")
 VARIO_HISTORY_START = pd.Timestamp("2025-12-11 00:00:00")
@@ -205,3 +206,45 @@ if st.button("Lancer l'analyse", type="primary"):
             "export_apres_kWh":chosen.export_after,
         })
         st.dataframe(detail,use_container_width=True,height=430,hide_index=True)
+
+
+    st.divider()
+    st.subheader("Rapport client PDF")
+    st.caption(
+        "Le rapport reprend uniquement les informations utiles au client : comparaison des solutions, "
+        "origine des économies, projection annuelle et hypothèses principales."
+    )
+
+    report_monthly = monthly.copy()
+    pdf_bytes = generate_vario_report(
+        client_name=client,
+        period_start=merged.timestamp.min(),
+        period_end=merged.timestamp.max(),
+        period_days=period_days,
+        profile_transposed=profile_transposed,
+        capacity_kwh=capacity,
+        power_kw=power,
+        efficiency=efficiency,
+        soc_min=soc_min,
+        soc_max=soc_max,
+        feed_in_ct=feed_in_ct,
+        wear_ct=wear_ct,
+        double_cost=double_cost,
+        vario_cost=vario_cost,
+        vario_pv_bill=vario_pv.cost_chf,
+        vario_pv_economic=vario_pv.economic_cost_chf,
+        arbitrage_enabled=allow_grid_charge,
+        vario_grid_bill=(vario_grid.cost_chf if vario_grid is not None else None),
+        vario_grid_economic=(vario_grid.economic_cost_chf if vario_grid is not None else None),
+        cycles_annualized=best.cycles*annual_factor,
+        monthly_df=report_monthly,
+    )
+
+    st.download_button(
+        "Télécharger le rapport client PDF",
+        pdf_bytes,
+        file_name="analyse_vario_client.pdf",
+        mime="application/pdf",
+        type="primary",
+    )
+
