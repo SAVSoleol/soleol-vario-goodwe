@@ -1,15 +1,16 @@
-# Soleol — Double vs VARIO + batterie
+# Soleol — Double / VARIO + batterie optimisée
 
 Programme indépendant du Battery Sizer.
 
-Compare 4 scénarios :
-1. Tarif Double
+Scénarios :
+1. Double
 2. VARIO
-3. Tarif Double + batterie autoconsommation
-4. VARIO + batterie pilotée selon les prix
+3. Double + batterie PV
+4. VARIO + batterie PV optimisée économiquement
+5. Option : VARIO + arbitrage réseau
 
-Le fichier Groupe E fournit import/soutirage et surplus/export. Les valeurs kW sont converties en kWh par intervalle.
-Le mode 2025 -> 2026 permet de tester les vrais prix VARIO 2026 avec un profil mesuré en 2025.
+La stratégie batterie est calculée par programmation linéaire sur toute la période historique.
+Objectif : minimiser la facture (import x prix - export x reprise) sous contraintes de capacité,
+puissance, rendement et SOC. Le SOC final est remis au SOC initial pour éviter un gain artificiel.
 
-La stratégie VARIO stocke le surplus PV et décharge la batterie pendant les prix élevés.
-Aucune charge depuis le réseau n'est autorisée dans cette version.
+La projection annuelle est indicative et annualise simplement la période couverte.
