@@ -1,67 +1,94 @@
 
 from __future__ import annotations
+
 import tempfile
 from pathlib import Path
 import pandas as pd
+import numpy as np
 import streamlit as st
+
 from billing import compare_double_vario
 from groupe_e_api import fetch_vario
 from meter_loader import load_consumption_file
 from battery_opt import optimize_battery, double_price_vector
-from report_vario import generate_vario_report
+from reprise_groupe_e import repurchase_vector, quarterly_summary
+
+try:
+    from report_vario import generate_vario_report
+    HAS_REPORT = True
+except Exception:
+    HAS_REPORT = False
 
 st.set_page_config(page_title="Soleol — Analyse VARIO", layout="wide")
+VARIO_HISTORY_START = pd.Timestamp("2025-12-11 00:00:00")
+MONTHS_FR = {
+    1:"Janvier",2:"Février",3:"Mars",4:"Avril",5:"Mai",6:"Juin",
+    7:"Juillet",8:"Août",9:"Septembre",10:"Octobre",11:"Novembre",12:"Décembre"
+}
 
 st.markdown("""
 <style>
-.kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:10px 0 20px}
-.kpi-card{border-radius:12px;padding:18px 22px;border:1px solid;min-height:92px}
-.kpi-label{font-size:.86rem;font-weight:750;margin-bottom:8px}
-.kpi-value{font-size:1.65rem;font-weight:850;line-height:1.05}
-.kpi-sub{font-size:.78rem;margin-top:8px;font-weight:700}
-.kpi-red{background:linear-gradient(100deg,rgba(127,29,29,.42),rgba(69,10,10,.20));border-color:rgba(239,68,68,.55)}
+.block-container{max-width:1500px;padding-top:1.6rem}
+.kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:8px 0 12px}
+.kpi-card{border-radius:12px;padding:16px 18px;border:1px solid;min-height:88px}
+.kpi-label{font-size:.84rem;font-weight:750;margin-bottom:7px}
+.kpi-value{font-size:1.55rem;font-weight:850;line-height:1.05}
+.kpi-sub{font-size:.76rem;margin-top:7px;font-weight:650}
+.kpi-red{background:linear-gradient(100deg,rgba(127,29,29,.42),rgba(69,10,10,.18));border-color:rgba(239,68,68,.5)}
 .kpi-red .kpi-label,.kpi-red .kpi-sub{color:#fca5a5}
-.kpi-blue{background:linear-gradient(100deg,rgba(30,64,175,.35),rgba(7,32,63,.22));border-color:rgba(59,130,246,.55)}
+.kpi-blue{background:linear-gradient(100deg,rgba(30,64,175,.35),rgba(7,32,63,.20));border-color:rgba(59,130,246,.5)}
 .kpi-blue .kpi-label,.kpi-blue .kpi-sub{color:#93c5fd}
-.kpi-green{background:linear-gradient(100deg,rgba(20,83,45,.38),rgba(5,46,22,.20));border-color:rgba(34,197,94,.45)}
+.kpi-green{background:linear-gradient(100deg,rgba(20,83,45,.38),rgba(5,46,22,.18));border-color:rgba(34,197,94,.45)}
 .kpi-green .kpi-label,.kpi-green .kpi-sub{color:#86efac}
-.kpi-purple{background:linear-gradient(100deg,rgba(88,28,135,.42),rgba(59,7,100,.22));border-color:rgba(168,85,247,.55)}
+.kpi-purple{background:linear-gradient(100deg,rgba(88,28,135,.42),rgba(59,7,100,.20));border-color:rgba(168,85,247,.52)}
 .kpi-purple .kpi-label,.kpi-purple .kpi-sub{color:#d8b4fe}
-.vario-help{color:#a1a1aa;font-size:.86rem;margin:-5px 0 14px}
-.vario-box{border:1px solid rgba(234,179,8,.45);background:rgba(113,63,18,.13);border-radius:12px;padding:16px 18px;margin-bottom:16px}
-.vario-box b{color:#facc15}
+.kpi-orange{background:linear-gradient(100deg,rgba(124,45,18,.38),rgba(67,20,7,.18));border-color:rgba(249,115,22,.48)}
+.kpi-orange .kpi-label,.kpi-orange .kpi-sub{color:#fdba74}
+.section-shell{border:1px solid rgba(148,163,184,.18);border-radius:16px;padding:15px 17px;margin-bottom:16px;background:rgba(15,23,42,.18)}
+.compare-title{font-size:1.1rem;font-weight:850;margin-bottom:3px}
+.compare-sub{font-size:.78rem;color:#94a3b8;margin-bottom:8px}
 </style>
 """, unsafe_allow_html=True)
-VARIO_HISTORY_START = pd.Timestamp("2025-12-11 00:00:00")
-MONTHS_FR = {1:"Janvier",2:"Février",3:"Mars",4:"Avril",5:"Mai",6:"Juin",7:"Juillet",8:"Août",9:"Septembre",10:"Octobre",11:"Novembre",12:"Décembre"}
 
 st.title("Analyse tarifaire Groupe E")
-st.caption("Objectif : savoir si VARIO est intéressant, puis mesurer la valeur ajoutée d'une batterie.")
+st.caption("Comparaison du tarif Double, du tarif dynamique VARIO et du potentiel d'une batterie.")
 
+# ---------------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("1. Données client")
     client = st.text_input("Client / site", value="")
     uploaded = st.file_uploader("Courbe import / export réseau", type=["xlsx","xls","csv"])
     transpose_to_2026 = st.toggle("Utiliser un profil 2025 comme profil 2026", value=True)
 
-    st.header("2. Tarif Double")
+    st.header("2. Période d'analyse")
+    st.caption("La sélection des mois apparaît après lecture du fichier.")
+
+    st.header("3. Tarif Double")
     ht_ct = st.number_input("Haut tarif (ct/kWh)", min_value=0.0, value=29.32, step=0.01)
     bt_ct = st.number_input("Bas tarif (ct/kWh)", min_value=0.0, value=19.27, step=0.01)
     st.caption("HT : 07h–12h et 17h–23h. BT : le reste.")
 
-    st.header("3. Batterie")
+    st.header("4. Reprise PV Groupe E")
+    installation_kw = st.number_input(
+        "Puissance PV (kW)", min_value=0.1, value=10.0, step=0.5,
+        help="Le minimum Groupe E de 6 ct/kWh est directement applicable aux installations <30 kW."
+    )
+    sell_go = st.toggle("Céder la GO à Groupe E", value=False)
+    provisional_ct = st.number_input(
+        "Reprise provisoire trimestre non publié (ct/kWh)",
+        min_value=0.0, value=6.0, step=0.1,
+        help="Utilisée uniquement pour un trimestre dont le prix OFEN/Groupe E n'est pas encore publié."
+    )
+
+    st.header("5. Batterie")
     capacity = st.number_input("Capacité (kWh)", min_value=1.0, value=10.0, step=1.0)
     power = st.number_input("Puissance (kW)", min_value=0.5, value=5.0, step=0.5)
     efficiency = st.slider("Rendement aller-retour", 0.50, 1.00, 0.92, 0.01)
     soc_min = st.slider("SOC minimum (%)", 0, 50, 5)
     soc_max = st.slider("SOC maximum (%)", 50, 100, 95)
-    feed_in_ct = st.number_input("Reprise PV (ct/kWh)", min_value=0.0, value=6.0, step=0.1)
     allow_grid_charge = st.toggle("Autoriser la charge depuis le réseau", value=False)
-    wear_ct = st.number_input(
-        "Coût d'usure batterie (ct/kWh déchargé)",
-        min_value=0.0, value=4.0, step=0.5,
-        help="Intégré dans l'optimisation pour éviter les micro-arbitrages peu rentables."
-    )
+    wear_ct = st.number_input("Coût d'usure (ct/kWh déchargé)", min_value=0.0, value=4.0, step=0.5)
+
     with st.expander("Options avancées"):
         unit = st.selectbox("Forcer l'unité", ["auto","kW","kWh","W","Wh"], index=0)
 
@@ -77,277 +104,290 @@ def load_cached(name, raw, unit):
         return load_consumption_file(p, forced_unit=unit)
 
 try:
-    df, meta = load_cached(uploaded.name, uploaded.getvalue(), unit)
+    original_df, meta = load_cached(uploaded.name, uploaded.getvalue(), unit)
 except Exception as exc:
     st.error(f"Fichier non reconnu : {exc}")
     st.stop()
 
-original_df = df.copy()
-original_start = df.timestamp.min()
+# Transpose 2025 -> 2026 if requested
+analysis_df = original_df.copy()
 profile_transposed = False
-if transpose_to_2026 and original_start.year == 2025:
-    df = df.copy()
-    df["timestamp"] = df["timestamp"].map(lambda x: x.replace(year=2026))
+if transpose_to_2026 and analysis_df.timestamp.min().year == 2025:
+    analysis_df["timestamp"] = analysis_df["timestamp"].map(lambda x: x.replace(year=2026))
     profile_transposed = True
 
-st.success(f"Fichier reconnu : {meta.vendor} · {meta.n_rows:,} mesures · pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}")
+st.success(
+    f"Fichier reconnu : {meta.vendor} · {meta.n_rows:,} mesures · "
+    f"pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}"
+)
 if profile_transposed:
     st.warning("MODE SIMULATION — Profil 2025 transposé sur 2026 ; prix VARIO réels 2026.")
 
-if not original_df.empty:
-    original_prices = double_price_vector(original_df["timestamp"], ht_ct/100, bt_ct/100)
-    ht_mask = abs(original_prices - ht_ct/100) < 1e-12
-    bt_mask = ~ht_mask
-
-    ht_kwh = float(original_df.loc[ht_mask, "import_kWh"].sum())
-    bt_kwh = float(original_df.loc[bt_mask, "import_kWh"].sum())
-    total_double_kwh = ht_kwh + bt_kwh
-
-    ht_cost = ht_kwh * ht_ct / 100.0
-    bt_cost = bt_kwh * bt_ct / 100.0
-    total_double_cost = ht_cost + bt_cost
-
-    ht_share = ht_kwh / total_double_kwh * 100.0 if total_double_kwh > 0 else 0.0
-    bt_share = bt_kwh / total_double_kwh * 100.0 if total_double_kwh > 0 else 0.0
-
-    export_total_kwh = float(original_df["export_kWh"].sum()) if "export_kWh" in original_df.columns else 0.0
-    export_revenue_chf = export_total_kwh * feed_in_ct / 100.0
-
-    profile_year = int(original_df["timestamp"].dt.year.mode().iloc[0])
-
-    st.subheader(f"Répartition de la consommation {profile_year} — Tarif Double")
-    st.caption(
-        f"Calcul sur le soutirage réseau du profil original avec les tarifs saisis "
-        f"({ht_ct:.2f} ct/kWh HT et {bt_ct:.2f} ct/kWh BT)."
-    )
-
-    st.markdown(
-        f"""
-        <div class="kpi-grid">
-          <div class="kpi-card kpi-red">
-            <div class="kpi-label">Consommation haut tarif (HT)</div>
-            <div class="kpi-value">{ht_kwh:,.0f} kWh</div>
-            <div class="kpi-sub">{ht_share:.1f} % du soutirage</div>
-          </div>
-          <div class="kpi-card kpi-red">
-            <div class="kpi-label">Coût haut tarif (HT)</div>
-            <div class="kpi-value">{ht_cost:,.2f} CHF</div>
-            <div class="kpi-sub">{ht_ct:.2f} ct/kWh</div>
-          </div>
-          <div class="kpi-card kpi-blue">
-            <div class="kpi-label">Consommation bas tarif (BT)</div>
-            <div class="kpi-value">{bt_kwh:,.0f} kWh</div>
-            <div class="kpi-sub">{bt_share:.1f} % du soutirage</div>
-          </div>
-          <div class="kpi-card kpi-blue">
-            <div class="kpi-label">Coût bas tarif (BT)</div>
-            <div class="kpi-value">{bt_cost:,.2f} CHF</div>
-            <div class="kpi-sub">{bt_ct:.2f} ct/kWh</div>
-          </div>
-          <div class="kpi-card kpi-green">
-            <div class="kpi-label">Consommation totale</div>
-            <div class="kpi-value">{total_double_kwh:,.0f} kWh</div>
-            <div class="kpi-sub">HT + BT</div>
-          </div>
-          <div class="kpi-card kpi-green">
-            <div class="kpi-label">Coût total au tarif Double</div>
-            <div class="kpi-value">{total_double_cost:,.2f} CHF</div>
-            <div class="kpi-sub">HT + BT, hors frais fixes</div>
-          </div>
-          <div class="kpi-card kpi-purple">
-            <div class="kpi-label">Export total (réseau)</div>
-            <div class="kpi-value">{export_total_kwh:,.0f} kWh</div>
-            <div class="kpi-sub">Énergie injectée sur la période</div>
-          </div>
-          <div class="kpi-card kpi-purple">
-            <div class="kpi-label">Revenus d’injection (reprise PV)</div>
-            <div class="kpi-value">{export_revenue_chf:,.2f} CHF</div>
-            <div class="kpi-sub">{feed_in_ct:.2f} ct/kWh</div>
-          </div>
-        </div>
-        """.replace(",", " "),
-        unsafe_allow_html=True,
-    )
-
-if st.button("Lancer l'analyse", type="primary"):
-    today = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
-    start = max(VARIO_HISTORY_START, df.timestamp.min().floor("15min"))
-    end = min(today.ceil("15min"), df.timestamp.max().ceil("15min") + pd.Timedelta(minutes=15))
-
-    with st.spinner("Récupération des prix VARIO..."):
-        vario, _ = fetch_vario(start, end)
-
-    data = df.copy()
-    data["timestamp"] = data["timestamp"].dt.floor("15min")
-    merged = data.merge(vario, on="timestamp", how="inner")
-    if merged.empty:
-        st.error("Aucune période commune.")
+# ---------------------------------------------------------------------- month selector
+available_periods = sorted(analysis_df["timestamp"].dt.to_period("M").unique().tolist())
+labels = [f"{MONTHS_FR[p.month]} {p.year}" for p in available_periods]
+with st.sidebar:
+    if available_periods:
+        start_label = st.selectbox("Mois de début", labels, index=0)
+        end_default = min(len(labels)-1, max(0, pd.Timestamp.now().month-1 if analysis_df.timestamp.min().year == pd.Timestamp.now().year else len(labels)-1))
+        end_label = st.selectbox("Mois de fin", labels, index=end_default)
+        start_period = available_periods[labels.index(start_label)]
+        end_period = available_periods[labels.index(end_label)]
+    else:
+        st.error("Aucun mois détecté.")
         st.stop()
 
-    base, r = compare_double_vario(
-        merged, ht_chf_kwh=ht_ct/100, bt_chf_kwh=bt_ct/100,
-        periods=((7,12),(17,23)), weekend_low=False, vat_factor=1.0
+if start_period > end_period:
+    st.error("Le mois de début doit être antérieur au mois de fin.")
+    st.stop()
+
+period_start = start_period.start_time
+period_end = end_period.end_time
+period_df = analysis_df[
+    (analysis_df.timestamp >= period_start) &
+    (analysis_df.timestamp <= period_end)
+].copy()
+
+if period_df.empty:
+    st.error("Aucune donnée sur la période sélectionnée.")
+    st.stop()
+
+# Original-period counterpart for Double display if transposed
+if profile_transposed:
+    orig_start = period_start.replace(year=2025)
+    orig_end = period_end.replace(year=2025)
+    display_double_df = original_df[
+        (original_df.timestamp >= orig_start) &
+        (original_df.timestamp <= orig_end)
+    ].copy()
+    period_label = f"{MONTHS_FR[start_period.month]} à {MONTHS_FR[end_period.month]} 2026 (profil 2025 transposé)"
+else:
+    display_double_df = period_df.copy()
+    period_label = f"{start_label} à {end_label}"
+
+st.subheader(f"Période analysée : {period_label}")
+
+# ---------------------------------------------------------------------- Double side
+double_prices_display = double_price_vector(display_double_df.timestamp, ht_ct/100, bt_ct/100)
+ht_mask = np.isclose(double_prices_display, ht_ct/100)
+bt_mask = ~ht_mask
+
+ht_kwh = float(display_double_df.loc[ht_mask, "import_kWh"].sum())
+bt_kwh = float(display_double_df.loc[bt_mask, "import_kWh"].sum())
+total_import = ht_kwh + bt_kwh
+ht_cost = ht_kwh * ht_ct/100
+bt_cost = bt_kwh * bt_ct/100
+double_import_cost = ht_cost + bt_cost
+
+# Reprise vector aligned to selected analysis period; for display Double use same calendar year as simulation,
+# because the comparison concerns the tariff scenario being tested.
+reprise_vec, reprise_labels = repurchase_vector(
+    period_df.timestamp,
+    installation_kw=installation_kw,
+    sell_go=sell_go,
+    provisional_ct=provisional_ct,
+)
+export_total = float(period_df.export_kWh.sum())
+export_revenue = float(np.dot(period_df.export_kWh.values, reprise_vec))
+double_net = double_import_cost - export_revenue
+
+# ---------------------------------------------------------------------- Fetch VARIO early so right panel can be displayed
+today = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
+api_start = max(VARIO_HISTORY_START, period_df.timestamp.min().floor("15min"))
+api_end = min(today.ceil("15min"), period_df.timestamp.max().ceil("15min") + pd.Timedelta(minutes=15))
+
+if api_end <= api_start:
+    vario = pd.DataFrame()
+    merged = pd.DataFrame()
+else:
+    with st.spinner("Récupération des prix VARIO pour la période sélectionnée..."):
+        try:
+            vario, _ = fetch_vario(api_start, api_end)
+        except Exception as exc:
+            st.error(f"API Groupe E : {exc}")
+            vario = pd.DataFrame()
+
+data_q = period_df.copy()
+data_q["timestamp"] = data_q["timestamp"].dt.floor("15min")
+merged = data_q.merge(vario, on="timestamp", how="inner") if not vario.empty else pd.DataFrame()
+
+if not merged.empty:
+    # Reprise vector must match actual common VARIO timestamps.
+    feed_vec, feed_labels = repurchase_vector(
+        merged.timestamp,
+        installation_kw=installation_kw,
+        sell_go=sell_go,
+        provisional_ct=provisional_ct,
+    )
+    vario_import_cost = float(np.dot(merged.import_kWh.values, merged.vario_chf_kwh.values))
+    vario_export_revenue = float(np.dot(merged.export_kWh.values, feed_vec))
+    vario_net = vario_import_cost - vario_export_revenue
+    vario_avg_ct = (
+        vario_import_cost / merged.import_kWh.sum() * 100
+        if merged.import_kWh.sum() > 0 else 0.0
+    )
+    # Double on exactly same comparable intervals
+    dprices_common = double_price_vector(merged.timestamp, ht_ct/100, bt_ct/100)
+    double_common_import_cost = float(np.dot(merged.import_kWh.values, dprices_common))
+    double_common_export_revenue = float(np.dot(merged.export_kWh.values, feed_vec))
+    double_common_net = double_common_import_cost - double_common_export_revenue
+    saving_vario = double_common_net - vario_net
+else:
+    feed_vec = np.array([])
+    vario_import_cost = vario_export_revenue = vario_net = vario_avg_ct = saving_vario = 0.0
+    double_common_net = 0.0
+
+# ---------------------------------------------------------------------- visual side-by-side tables
+left, right = st.columns(2)
+
+with left:
+    st.markdown('<div class="section-shell">', unsafe_allow_html=True)
+    st.markdown('<div class="compare-title">Tarif Double — HT / BT</div>', unsafe_allow_html=True)
+    st.markdown('<div class="compare-sub">Répartition du soutirage selon les plages haut et bas tarif.</div>', unsafe_allow_html=True)
+    ht_share = ht_kwh/total_import*100 if total_import else 0
+    bt_share = bt_kwh/total_import*100 if total_import else 0
+    st.markdown(f"""
+    <div class="kpi-grid">
+      <div class="kpi-card kpi-red"><div class="kpi-label">Consommation HT</div><div class="kpi-value">{ht_kwh:,.0f} kWh</div><div class="kpi-sub">{ht_share:.1f} %</div></div>
+      <div class="kpi-card kpi-red"><div class="kpi-label">Coût HT</div><div class="kpi-value">{ht_cost:,.2f} CHF</div><div class="kpi-sub">{ht_ct:.2f} ct/kWh</div></div>
+      <div class="kpi-card kpi-blue"><div class="kpi-label">Consommation BT</div><div class="kpi-value">{bt_kwh:,.0f} kWh</div><div class="kpi-sub">{bt_share:.1f} %</div></div>
+      <div class="kpi-card kpi-blue"><div class="kpi-label">Coût BT</div><div class="kpi-value">{bt_cost:,.2f} CHF</div><div class="kpi-sub">{bt_ct:.2f} ct/kWh</div></div>
+      <div class="kpi-card kpi-green"><div class="kpi-label">Consommation totale</div><div class="kpi-value">{total_import:,.0f} kWh</div><div class="kpi-sub">HT + BT</div></div>
+      <div class="kpi-card kpi-green"><div class="kpi-label">Coût achat total</div><div class="kpi-value">{double_import_cost:,.2f} CHF</div><div class="kpi-sub">hors frais fixes</div></div>
+      <div class="kpi-card kpi-purple"><div class="kpi-label">Export total</div><div class="kpi-value">{export_total:,.0f} kWh</div><div class="kpi-sub">injection réseau</div></div>
+      <div class="kpi-card kpi-purple"><div class="kpi-label">Revenus d'injection</div><div class="kpi-value">{export_revenue:,.2f} CHF</div><div class="kpi-sub">reprise Groupe E trimestrielle</div></div>
+    </div>
+    """.replace(",", " "), unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with right:
+    st.markdown('<div class="section-shell">', unsafe_allow_html=True)
+    st.markdown('<div class="compare-title">Tarif VARIO — prix dynamique</div>', unsafe_allow_html=True)
+    st.markdown('<div class="compare-sub">Même profil, mais chaque quart d’heure est facturé au prix VARIO réel.</div>', unsafe_allow_html=True)
+    if merged.empty:
+        st.warning("Pas de prix VARIO disponible sur cette période.")
+    else:
+        st.markdown(f"""
+        <div class="kpi-grid">
+          <div class="kpi-card kpi-blue"><div class="kpi-label">Consommation comparée</div><div class="kpi-value">{merged.import_kWh.sum():,.0f} kWh</div><div class="kpi-sub">{len(merged):,} quarts d'heure</div></div>
+          <div class="kpi-card kpi-blue"><div class="kpi-label">Coût achat VARIO</div><div class="kpi-value">{vario_import_cost:,.2f} CHF</div><div class="kpi-sub">prix moyen {vario_avg_ct:.2f} ct/kWh</div></div>
+          <div class="kpi-card kpi-purple"><div class="kpi-label">Export total</div><div class="kpi-value">{merged.export_kWh.sum():,.0f} kWh</div><div class="kpi-sub">sur la période comparable</div></div>
+          <div class="kpi-card kpi-purple"><div class="kpi-label">Revenus d'injection</div><div class="kpi-value">{vario_export_revenue:,.2f} CHF</div><div class="kpi-sub">reprise Groupe E trimestrielle</div></div>
+          <div class="kpi-card kpi-green"><div class="kpi-label">Coût net VARIO</div><div class="kpi-value">{vario_net:,.2f} CHF</div><div class="kpi-sub">achat - revenus d'injection</div></div>
+          <div class="kpi-card kpi-orange"><div class="kpi-label">Économie vs Double</div><div class="kpi-value">{saving_vario:,.2f} CHF</div><div class="kpi-sub">{(saving_vario/double_common_net*100 if double_common_net else 0):+.1f} %</div></div>
+        </div>
+        """.replace(",", " "), unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------- quarterly repurchase summary
+st.subheader("Reprise photovoltaïque Groupe E appliquée")
+qsum = quarterly_summary(
+    period_df.timestamp,
+    installation_kw=installation_kw,
+    sell_go=sell_go,
+    provisional_ct=provisional_ct,
+)
+st.dataframe(qsum, use_container_width=True, hide_index=True)
+if any("provisoire" in x for x in qsum["Statut"].astype(str)):
+    st.warning(
+        "Au moins un trimestre n'a pas encore de prix définitif publié. "
+        "Le calcul utilise la valeur provisoire saisie dans la barre latérale."
+    )
+if installation_kw >= 30:
+    st.warning(
+        "Installation ≥30 kW : le minimum Groupe E est dégressif selon la puissance. "
+        "Le prix exact doit être confirmé selon le cas du client."
     )
 
-    feed_in = feed_in_ct/100
+# ---------------------------------------------------------------------- battery analysis
+if merged.empty:
+    st.stop()
+
+st.divider()
+st.subheader("Simulation batterie sur la période sélectionnée")
+
+if st.button("Optimiser la batterie", type="primary"):
+    if soc_max <= soc_min:
+        st.error("SOC maximum doit être supérieur au SOC minimum.")
+        st.stop()
+
     wear = wear_ct/100
-    export_revenue = float(merged.export_kWh.sum()*feed_in)
-    double_cost = r["double_chf"] - export_revenue
-    vario_cost = r["vario_chf"] - export_revenue
-    double_prices = double_price_vector(merged.timestamp, ht_ct/100, bt_ct/100)
-
     with st.spinner("Optimisation économique de la batterie..."):
-        double_bat = optimize_battery(
-            merged, double_prices, feed_in, capacity, power, meta.dt_hours,
-            efficiency, soc_min, soc_max, False, wear
-        )
-        vario_pv = optimize_battery(
-            merged, merged.vario_chf_kwh.values, feed_in, capacity, power, meta.dt_hours,
-            efficiency, soc_min, soc_max, False, wear
-        )
-        vario_grid = None
-        if allow_grid_charge:
-            vario_grid = optimize_battery(
-                merged, merged.vario_chf_kwh.values, feed_in, capacity, power, meta.dt_hours,
-                efficiency, soc_min, soc_max, True, wear
+        try:
+            vario_pv = optimize_battery(
+                merged, merged.vario_chf_kwh.values, feed_vec,
+                capacity, power, meta.dt_hours, efficiency,
+                soc_min, soc_max, False, wear
             )
+            vario_grid = None
+            if allow_grid_charge:
+                vario_grid = optimize_battery(
+                    merged, merged.vario_chf_kwh.values, feed_vec,
+                    capacity, power, meta.dt_hours, efficiency,
+                    soc_min, soc_max, True, wear
+                )
+        except Exception as exc:
+            st.error(str(exc))
+            st.stop()
 
+    best = vario_grid if vario_grid is not None else vario_pv
     period_days = len(merged)*meta.dt_hours/24
     annual_factor = 365/period_days if period_days else 0
 
-    st.subheader("1. VARIO seul est-il intéressant ?")
-    st.markdown(
-        '<div class="vario-help"><b>Tarif Double</b> = votre tarif de référence avec heures HT/BT. '
-        '<b>VARIO</b> = le même soutirage du client, sans batterie, mais facturé avec le prix dynamique '
-        'Groupe E de chaque quart d’heure.</div>',
-        unsafe_allow_html=True,
-    )
-    gain_vario = double_cost-vario_cost
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Tarif Double (HT / BT)", f"{double_cost:,.2f} CHF".replace(","," "))
-    c2.metric("Tarif VARIO (sans batterie)", f"{vario_cost:,.2f} CHF".replace(","," "))
-    c3.metric("Économie en passant à VARIO", f"{gain_vario:,.2f} CHF".replace(","," "), f"{(gain_vario/double_cost*100 if double_cost else 0):+.1f} %")
+    gain_pv = vario_net - vario_pv.cost_chf
+    net_gain_pv = vario_net - vario_pv.economic_cost_chf
 
-    st.subheader("2. Que rapporte une batterie chargée avec le surplus PV ?")
-    gross_pv = vario_cost-vario_pv.cost_chf
-    net_pv = vario_cost-vario_pv.economic_cost_chf
-    b1,b2,b3,b4 = st.columns(4)
-    b1.metric("VARIO sans batterie", f"{vario_cost:,.2f} CHF".replace(","," "))
-    b2.metric("Facture avec batterie", f"{vario_pv.cost_chf:,.2f} CHF".replace(","," "))
-    b3.metric("Gain brut batterie", f"{gross_pv:,.2f} CHF".replace(","," "))
-    b4.metric("Gain net après usure", f"{net_pv:,.2f} CHF".replace(","," "))
-    st.caption(f"Coût d'usure imputé : {vario_pv.wear_cost_chf:,.2f} CHF sur la période.".replace(","," "))
-
-    st.subheader("3. L'arbitrage réseau VARIO vaut-il la peine ?")
-    if allow_grid_charge:
-        gross_extra = vario_pv.cost_chf-vario_grid.cost_chf
-        net_extra = vario_pv.economic_cost_chf-vario_grid.economic_cost_chf
-        extra_cycles = vario_grid.cycles-vario_pv.cycles
-        a1,a2,a3,a4 = st.columns(4)
-        a1.metric("Batterie PV seule", f"{vario_pv.cost_chf:,.2f} CHF".replace(","," "))
-        a2.metric("Batterie + arbitrage", f"{vario_grid.cost_chf:,.2f} CHF".replace(","," "))
-        a3.metric("Gain brut arbitrage", f"{gross_extra:,.2f} CHF".replace(","," "))
-        a4.metric("Gain net arbitrage", f"{net_extra:,.2f} CHF".replace(","," "))
-        if net_extra > 0:
-            st.success(f"Arbitrage rentable après usure : +{net_extra:,.2f} CHF sur la période, pour {extra_cycles:.0f} cycles supplémentaires.".replace(","," "))
-        else:
-            st.warning("Avec ce coût d'usure, l'arbitrage réseau n'apporte pas de gain économique supplémentaire.")
-        best = vario_grid
+    if vario_grid is not None:
+        gain_arbitrage_extra = vario_pv.cost_chf - vario_grid.cost_chf
+        net_arbitrage_extra = vario_pv.economic_cost_chf - vario_grid.economic_cost_chf
     else:
-        st.info("Active « Autoriser la charge depuis le réseau » pour tester l'arbitrage.")
-        best = vario_pv
+        gain_arbitrage_extra = net_arbitrage_extra = 0.0
 
-    st.divider()
-    st.subheader("Résumé décisionnel")
-    total_bill_gain = double_cost-best.cost_chf
-    total_net_gain = double_cost-best.economic_cost_chf
-    s1,s2,s3,s4 = st.columns(4)
-    s1.metric("Gain facture période", f"{total_bill_gain:,.0f} CHF".replace(","," "))
-    s2.metric("Gain économique net", f"{total_net_gain:,.0f} CHF".replace(","," "))
-    s3.metric("Projection nette indicative", f"{total_net_gain*annual_factor:,.0f} CHF/an".replace(","," "))
-    s4.metric("Cycles annualisés", f"{best.cycles*annual_factor:.0f}/an")
-    st.caption(f"Période analysée : {period_days:.0f} jours. Projection annuelle = annualisation indicative.")
+    total_bill_gain = double_common_net - best.cost_chf
+    total_net_gain = double_common_net - best.economic_cost_chf
 
-    tab1, tab2, tab3 = st.tabs(["Comparaison mensuelle", "Économie mensuelle", "Pilotage batterie"])
-    m = merged[["timestamp","import_kWh","export_kWh","vario_chf_kwh"]].copy()
-    m["double"] = merged.import_kWh.values*double_prices - merged.export_kWh.values*feed_in
-    m["vario"] = merged.import_kWh.values*merged.vario_chf_kwh.values - merged.export_kWh.values*feed_in
-    m["vario_pv"] = vario_pv.import_after*merged.vario_chf_kwh.values - vario_pv.export_after*feed_in
-    if allow_grid_charge:
-        m["vario_grid"] = vario_grid.import_after*merged.vario_chf_kwh.values - vario_grid.export_after*feed_in
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("VARIO sans batterie", f"{vario_net:,.2f} CHF".replace(","," "))
+    c2.metric("VARIO + batterie PV", f"{vario_pv.cost_chf:,.2f} CHF".replace(","," "), f"{gain_pv:+.2f} CHF")
+    if vario_grid is not None:
+        c3.metric("VARIO + arbitrage", f"{vario_grid.cost_chf:,.2f} CHF".replace(","," "), f"{gain_arbitrage_extra:+.2f} CHF")
+    else:
+        c3.metric("Arbitrage réseau", "désactivé")
+    c4.metric("Gain net après usure", f"{total_net_gain:,.2f} CHF".replace(","," "))
 
-    cols = ["double","vario","vario_pv"] + (["vario_grid"] if allow_grid_charge else [])
-    monthly = m.set_index("timestamp")[cols].resample("MS").sum()
+    st.info(
+        f"Projection nette indicative : **{total_net_gain*annual_factor:,.0f} CHF/an** · "
+        f"Cycles annualisés : **{best.cycles*annual_factor:.0f}/an**".replace(",", " ")
+    )
+
+    # Monthly chart
+    detail = merged[["timestamp","import_kWh","export_kWh","vario_chf_kwh"]].copy()
+    detail["double"] = merged.import_kWh.values*dprices_common - merged.export_kWh.values*feed_vec
+    detail["vario"] = merged.import_kWh.values*merged.vario_chf_kwh.values - merged.export_kWh.values*feed_vec
+    detail["vario_pv"] = vario_pv.import_after*merged.vario_chf_kwh.values - vario_pv.export_after*feed_vec
+    if vario_grid is not None:
+        detail["vario_grid"] = vario_grid.import_after*merged.vario_chf_kwh.values - vario_grid.export_after*feed_vec
+
+    mcols = ["double","vario","vario_pv"] + (["vario_grid"] if vario_grid is not None else [])
+    monthly = detail.set_index("timestamp")[mcols].resample("MS").sum()
     monthly["Mois"] = [MONTHS_FR[x.month] for x in monthly.index]
 
+    tab1,tab2 = st.tabs(["Comparaison mensuelle","Pilotage batterie"])
     with tab1:
-        names={"double":"Double","vario":"VARIO","vario_pv":"VARIO + batterie PV","vario_grid":"VARIO + arbitrage"}
-        st.bar_chart(monthly.set_index("Mois")[cols].rename(columns=names))
-        st.caption("Plus la barre est basse, plus la facture du mois est faible.")
-
+        ren={"double":"Double","vario":"VARIO","vario_pv":"VARIO + batterie PV","vario_grid":"VARIO + arbitrage"}
+        st.bar_chart(monthly.set_index("Mois")[mcols].rename(columns=ren))
     with tab2:
-        savings=pd.DataFrame(index=monthly.index)
-        savings["VARIO seul"]=monthly["double"]-monthly["vario"]
-        savings["VARIO + batterie PV"]=monthly["double"]-monthly["vario_pv"]
-        if allow_grid_charge:
-            savings["VARIO + arbitrage"]=monthly["double"]-monthly["vario_grid"]
-        savings["Mois"]=[MONTHS_FR[x.month] for x in savings.index]
-        st.bar_chart(savings.set_index("Mois"))
-        st.caption("Valeur positive = économie par rapport au Double sans batterie.")
-
-    with tab3:
-        chosen=best
-        detail=pd.DataFrame({
-            "timestamp":merged.timestamp,
-            "prix_VARIO_ct_kWh":merged.vario_chf_kwh*100,
-            "import_avant_kWh":merged.import_kWh,
-            "export_avant_kWh":merged.export_kWh,
-            "charge_kWh":chosen.charge_kwh,
-            "decharge_kWh":chosen.discharge_kwh,
-            "SOC_kWh":chosen.soc_kwh,
-            "import_apres_kWh":chosen.import_after,
-            "export_apres_kWh":chosen.export_after,
+        chosen = best
+        control = pd.DataFrame({
+            "timestamp": merged.timestamp,
+            "prix_VARIO_ct_kWh": merged.vario_chf_kwh*100,
+            "reprise_PV_ct_kWh": feed_vec*100,
+            "import_avant_kWh": merged.import_kWh,
+            "export_avant_kWh": merged.export_kWh,
+            "charge_kWh": chosen.charge_kwh,
+            "decharge_kWh": chosen.discharge_kwh,
+            "SOC_kWh": chosen.soc_kwh,
+            "import_apres_kWh": chosen.import_after,
+            "export_apres_kWh": chosen.export_after,
         })
-        st.dataframe(detail,use_container_width=True,height=430,hide_index=True)
-
-
-    st.divider()
-    st.subheader("Rapport client PDF")
-    st.caption(
-        "Le rapport reprend uniquement les informations utiles au client : comparaison des solutions, "
-        "origine des économies, projection annuelle et hypothèses principales."
-    )
-
-    report_monthly = monthly.copy()
-    pdf_bytes = generate_vario_report(
-        client_name=client,
-        period_start=merged.timestamp.min(),
-        period_end=merged.timestamp.max(),
-        period_days=period_days,
-        profile_transposed=profile_transposed,
-        capacity_kwh=capacity,
-        power_kw=power,
-        efficiency=efficiency,
-        soc_min=soc_min,
-        soc_max=soc_max,
-        feed_in_ct=feed_in_ct,
-        wear_ct=wear_ct,
-        double_cost=double_cost,
-        vario_cost=vario_cost,
-        vario_pv_bill=vario_pv.cost_chf,
-        vario_pv_economic=vario_pv.economic_cost_chf,
-        arbitrage_enabled=allow_grid_charge,
-        vario_grid_bill=(vario_grid.cost_chf if vario_grid is not None else None),
-        vario_grid_economic=(vario_grid.economic_cost_chf if vario_grid is not None else None),
-        cycles_annualized=best.cycles*annual_factor,
-        monthly_df=report_monthly,
-    )
-
-    st.download_button(
-        "Télécharger le rapport client PDF",
-        pdf_bytes,
-        file_name="analyse_vario_client.pdf",
-        mime="application/pdf",
-        type="primary",
-    )
-
+        st.dataframe(control, use_container_width=True, height=430, hide_index=True)

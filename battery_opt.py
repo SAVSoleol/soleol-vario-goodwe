@@ -103,7 +103,12 @@ def optimize_battery(
 
     obj = np.zeros(nv, dtype=float)
     obj[G:G+n] = prices
-    obj[E:E+n] = -float(feed_in_chf_kwh)
+    feed = np.asarray(feed_in_chf_kwh, dtype=float)
+    if feed.ndim == 0:
+        feed = np.full(n, float(feed), dtype=float)
+    if len(feed) != n:
+        raise ValueError("Longueur du tarif de reprise incompatible avec les données.")
+    obj[E:E+n] = -feed
     obj[D:D+n] = float(wear_cost_chf_per_kwh)
 
     # Bounds
@@ -173,7 +178,7 @@ def optimize_battery(
     s = x[S:S+n]
 
     import_cost = float(np.dot(g, prices))
-    export_revenue = float(e.sum() * float(feed_in_chf_kwh))
+    export_revenue = float(np.dot(e, feed))
     energy_bill_cost = import_cost - export_revenue
     wear_cost = float(d.sum() * float(wear_cost_chf_per_kwh))
     economic_cost = energy_bill_cost + wear_cost
