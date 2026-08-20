@@ -3,331 +3,221 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-
 import pandas as pd
 import streamlit as st
 
 from billing import compare_double_vario
 from groupe_e_api import fetch_vario
 from meter_loader import load_consumption_file
+from battery_sim import simulate_double_battery, simulate_vario_battery
 
-st.set_page_config(page_title="Soleol — Double vs VARIO", layout="wide")
+st.set_page_config(page_title="Soleol — Double vs VARIO + batterie", layout="wide")
 
 VARIO_HISTORY_START = pd.Timestamp("2025-12-11 00:00:00")
-
-st.markdown("""
-<style>
-.block-container {max-width: 1450px; padding-top: 2rem;}
-.result-card {
-    border: 1px solid rgba(148,163,184,.22);
-    border-radius: 16px;
-    padding: 20px 24px;
-    background: rgba(15,23,42,.32);
+MONTHS_FR = {
+    1:"Janvier",2:"Février",3:"Mars",4:"Avril",5:"Mai",6:"Juin",
+    7:"Juillet",8:"Août",9:"Septembre",10:"Octobre",11:"Novembre",12:"Décembre"
 }
-.big-result {
-    font-size: 2.4rem;
-    font-weight: 800;
-    margin-top: .2rem;
-}
-.muted {color:#94a3b8;}
-</style>
-""", unsafe_allow_html=True)
 
 st.title("Analyse tarifaire Groupe E")
-st.caption("Combien ce client aurait-il économisé avec VARIO plutôt qu'avec le tarif Double ?")
+st.caption("Comparaison Double / VARIO et potentiel supplémentaire d'une batterie.")
 
 with st.sidebar:
     st.header("1. Client")
     client = st.text_input("Client / site", value="")
-    uploaded = st.file_uploader(
-        "Courbe de soutirage réseau",
-        type=["xlsx", "xls", "csv"],
-        help="Le programme détecte automatiquement les colonnes, l'unité et le pas de temps.",
-    )
+    uploaded = st.file_uploader("Courbe import / export réseau", type=["xlsx","xls","csv"])
     transpose_to_2026 = st.toggle(
         "Utiliser un profil 2025 comme profil 2026",
         value=True,
-        help="Conserve les valeurs mesurées et remplace uniquement l'année 2025 par 2026.",
+        help="Les valeurs sont conservées ; seule l'année est transposée en 2026."
     )
 
     st.header("2. Tarif Double")
-    st.caption("Prix variables à comparer au prix VARIO intégré. Frais fixes identiques exclus.")
-    ht_ct = st.number_input("Haut tarif (ct/kWh)", min_value=0.0, value=29.32, step=0.01, format="%.2f")
-    bt_ct = st.number_input("Bas tarif (ct/kWh)", min_value=0.0, value=19.27, step=0.01, format="%.2f")
+    ht_ct = st.number_input("Haut tarif (ct/kWh)", min_value=0.0, value=29.32, step=0.01)
+    bt_ct = st.number_input("Bas tarif (ct/kWh)", min_value=0.0, value=19.27, step=0.01)
     st.caption("HT : 07h–12h et 17h–23h. BT : le reste.")
-    vat = st.toggle("Ajouter TVA 8.1 % aux deux scénarios", value=False)
+
+    st.header("3. Batterie")
+    capacity = st.number_input("Capacité batterie (kWh)", min_value=1.0, value=10.0, step=1.0)
+    power = st.number_input("Puissance batterie (kW)", min_value=0.5, value=5.0, step=0.5)
+    efficiency = st.slider("Rendement aller-retour", 0.50, 1.00, 0.92, 0.01)
+    feed_in_ct = st.number_input("Reprise PV / injection (ct/kWh)", min_value=0.0, value=6.0, step=0.1)
 
     with st.expander("Options avancées"):
-        unit = st.selectbox("Forcer l'unité", ["auto", "kW", "kWh", "W", "Wh"], index=0)
-        st.caption("Laisser « auto » dans la grande majorité des cas.")
+        unit = st.selectbox("Forcer l'unité", ["auto","kW","kWh","W","Wh"], index=0)
 
 if uploaded is None:
-    st.info("Importe la courbe de soutirage réseau du client pour lancer l'analyse.")
+    st.info("Importe une courbe de charge Groupe E pour commencer.")
     st.stop()
 
 @st.cache_data(show_spinner=False)
-def load_cached(name: str, raw: bytes, unit: str):
+def load_cached(name, raw, unit):
     with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / name
+        p = Path(d)/name
         p.write_bytes(raw)
         return load_consumption_file(p, forced_unit=unit)
 
 try:
-    load_df, meta = load_cached(uploaded.name, uploaded.getvalue(), unit)
+    df, meta = load_cached(uploaded.name, uploaded.getvalue(), unit)
 except Exception as exc:
     st.error(f"Fichier non reconnu : {exc}")
     st.stop()
 
-original_start = load_df["timestamp"].min()
-original_end = load_df["timestamp"].max()
+original_start = df["timestamp"].min()
+original_end = df["timestamp"].max()
 profile_transposed = False
 if transpose_to_2026 and original_start.year == 2025:
-    load_df = load_df.copy()
-    load_df["timestamp"] = load_df["timestamp"].map(lambda x: x.replace(year=2026))
+    df = df.copy()
+    df["timestamp"] = df["timestamp"].map(lambda x: x.replace(year=2026))
     profile_transposed = True
 
 st.success(
-    f"Fichier reconnu automatiquement : {meta.vendor} · "
-    f"{meta.n_rows:,} mesures · pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}"
+    f"Fichier reconnu : {meta.vendor} · {meta.n_rows:,} mesures · "
+    f"pas {meta.dt_hours*60:.0f} min · unité {meta.input_unit}"
 )
 
 if profile_transposed:
     st.warning(
-        "MODE SIMULATION — Profil de charge 2025 transposé sur 2026. "
-        "Les consommations restent identiques ; seules les dates passent en 2026. "
-        "Les prix VARIO sont les prix réels 2026 disponibles."
+        "MODE SIMULATION — Profil 2025 transposé sur 2026. "
+        "Les prix VARIO utilisés sont les prix réels 2026 disponibles."
     )
 
 with st.expander("Détails de détection"):
-    st.write(f"**Colonne date/heure :** {meta.date_column}")
-    st.write(f"**Colonne soutirage :** {meta.import_column}")
-    st.write(f"**Convention horodatage :** {meta.timestamp_convention}")
+    st.write(f"Date/heure : **{meta.date_column}**")
+    st.write(f"Import : **{meta.import_column}**")
+    st.write(f"Export : **{meta.export_column}**")
+    st.write(f"Import total : **{df.import_kWh.sum():,.0f} kWh**".replace(","," "))
+    st.write(f"Export total : **{df.export_kWh.sum():,.0f} kWh**".replace(","," "))
     if profile_transposed:
-        st.write(f"**Période originale :** {original_start:%d.%m.%Y %H:%M} → {original_end:%d.%m.%Y %H:%M}")
-        st.write(f"**Période simulée :** {load_df.timestamp.min():%d.%m.%Y %H:%M} → {load_df.timestamp.max():%d.%m.%Y %H:%M}")
-    else:
-        st.write(
-            f"**Période du fichier :** {load_df.timestamp.min():%d.%m.%Y %H:%M} → "
-            f"{load_df.timestamp.max():%d.%m.%Y %H:%M}"
-        )
-    st.write(f"**Soutirage total du fichier :** {load_df.import_kWh.sum():,.0f} kWh".replace(",", " "))
+        st.write(f"Période originale : {original_start:%d.%m.%Y} → {original_end:%d.%m.%Y}")
+        st.write(f"Période simulée : {df.timestamp.min():%d.%m.%Y} → {df.timestamp.max():%d.%m.%Y}")
 
-preview = load_df.head(8).copy()
-preview["timestamp"] = preview["timestamp"].dt.strftime("%d.%m.%Y %H:%M")
-with st.expander("Aperçu des mesures"):
-    st.dataframe(preview, use_container_width=True, hide_index=True)
-
-if st.button("Comparer Double vs VARIO", type="primary"):
-    # Historical API window: always request from the known beginning of available history
-    # up to today, but never beyond the client's own data range.
+if st.button("Analyser les 4 scénarios", type="primary"):
     today = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
-    client_start = load_df["timestamp"].min().floor("15min")
-    client_end = load_df["timestamp"].max().ceil("15min") + pd.Timedelta(minutes=15)
+    start = max(VARIO_HISTORY_START, df.timestamp.min().floor("15min"))
+    end = min(today.ceil("15min"), df.timestamp.max().ceil("15min")+pd.Timedelta(minutes=15))
 
-    api_start = max(VARIO_HISTORY_START, client_start)
-    api_end = min(today.ceil("15min"), client_end)
-
-    if api_end <= api_start:
-        st.error(
-            "Le fichier client ne chevauche pas encore l'historique VARIO disponible "
-            "depuis le 11.12.2025."
-        )
-        st.stop()
-
-    with st.spinner("Récupération de tout l'historique VARIO disponible..."):
+    with st.spinner("Récupération des prix VARIO..."):
         try:
-            vario, publication = fetch_vario(api_start, api_end)
+            vario, publication = fetch_vario(start, end)
         except Exception as exc:
             st.error(f"API Groupe E : {exc}")
             st.stop()
 
-    if vario.empty:
-        st.error("Aucun prix VARIO n'est disponible pour la période commune.")
-        st.stop()
-
-    data = load_df.copy()
+    data = df.copy()
     data["timestamp"] = data["timestamp"].dt.floor("15min")
     merged = data.merge(vario, on="timestamp", how="inner")
-
     if merged.empty:
-        st.error("Aucun quart d'heure commun entre le profil client et les prix VARIO disponibles.")
+        st.error("Aucune période commune entre le profil et VARIO.")
         st.stop()
 
-    calc, r = compare_double_vario(
+    # Baseline Double/VARIO import comparison.
+    base, base_r = compare_double_vario(
         merged,
-        ht_chf_kwh=ht_ct / 100.0,
-        bt_chf_kwh=bt_ct / 100.0,
-        periods=((7.0, 12.0), (17.0, 23.0)),
+        ht_chf_kwh=ht_ct/100,
+        bt_chf_kwh=bt_ct/100,
+        periods=((7,12),(17,23)),
         weekend_low=False,
-        vat_factor=1.081 if vat else 1.0,
+        vat_factor=1.0,
     )
 
-    # Coverage is assessed only on the period that could theoretically be compared,
-    # not on the entire customer file if it starts before 11 Dec 2025.
-    theoretical = data[
-        (data["timestamp"] >= api_start) &
-        (data["timestamp"] < api_end)
-    ]
-    comparable_points = len(calc)
-    theoretical_points = len(theoretical)
-    coverage = comparable_points / theoretical_points * 100.0 if theoretical_points else 0.0
-    compared_days = comparable_points * meta.dt_hours / 24.0
+    # Include export revenue for all four energy-bill scenarios.
+    feed_in = feed_in_ct/100
+    export_revenue_before = float((merged["export_kWh"] * feed_in).sum())
+    double_net = base_r["double_chf"] - export_revenue_before
+    vario_net = base_r["vario_chf"] - export_revenue_before
 
-    st.subheader("Résultat cumulé")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Tarif Double", f"{r['double_chf']:,.2f} CHF".replace(",", " "))
-    c2.metric("Tarif VARIO", f"{r['vario_chf']:,.2f} CHF".replace(",", " "))
-    c3.metric(
-        "Économie VARIO",
-        f"{r['saving_chf']:,.2f} CHF".replace(",", " "),
-        f"{r['saving_pct']:+.1f} %",
+    dbl_bat = simulate_double_battery(
+        merged, ht_ct/100, bt_ct/100, feed_in,
+        capacity, power, meta.dt_hours, efficiency
+    )
+    var_bat = simulate_vario_battery(
+        merged, feed_in, capacity, power, meta.dt_hours, efficiency
     )
 
-    if r["saving_chf"] >= 0:
-        st.success(
-            f"Sur toute la période comparable, "
-            f"**{client or 'ce client'} aurait économisé {r['saving_chf']:,.2f} CHF "
-            f"({r['saving_pct']:.1f} %) avec VARIO**.".replace(",", " ")
-        )
-    else:
-        st.warning(
-            f"Sur toute la période comparable, "
-            f"**VARIO aurait coûté {abs(r['saving_chf']):,.2f} CHF de plus "
-            f"({abs(r['saving_pct']):.1f} %) à {client or 'ce client'}**.".replace(",", " ")
-        )
+    st.subheader("Comparaison des 4 scénarios")
+    a,b,c,d = st.columns(4)
+    a.metric("1. Double", f"{double_net:,.2f} CHF".replace(","," "))
+    b.metric("2. VARIO", f"{vario_net:,.2f} CHF".replace(","," "),
+             f"{double_net-vario_net:+.2f} CHF vs Double")
+    c.metric("3. Double + batterie", f"{dbl_bat.cost_chf:,.2f} CHF".replace(","," "),
+             f"{double_net-dbl_bat.cost_chf:+.2f} CHF")
+    d.metric("4. VARIO + batterie", f"{var_bat.cost_chf:,.2f} CHF".replace(","," "),
+             f"{double_net-var_bat.cost_chf:+.2f} CHF vs Double")
 
-    q1, q2, q3, q4 = st.columns(4)
-    q1.metric("Consommation comparée", f"{r['energy_kwh']:,.0f} kWh".replace(",", " "))
-    q2.metric("Prix moyen Double", f"{r['avg_double_chf_kwh']*100:.2f} ct/kWh")
-    q3.metric("Prix moyen VARIO", f"{r['avg_vario_chf_kwh']*100:.2f} ct/kWh")
-    q4.metric("Couverture période comparable", f"{coverage:.1f} %")
-
-    st.info(
-        f"Historique VARIO utilisé : **{calc.timestamp.min():%d.%m.%Y} → "
-        f"{calc.timestamp.max():%d.%m.%Y}** · environ **{compared_days:.0f} jours**. "
-        "Cette période s'allonge automatiquement à mesure que de nouveaux prix VARIO sont publiés."
+    best_gain = double_net - var_bat.cost_chf
+    st.success(
+        f"Avec une batterie de **{capacity:.0f} kWh / {power:.1f} kW**, "
+        f"le scénario VARIO piloté selon les prix économise **{best_gain:,.2f} CHF** "
+        f"par rapport au tarif Double sans batterie sur la période analysée.".replace(","," ")
     )
 
-    if profile_transposed:
-        st.caption("Hypothèse : le comportement de consommation en 2026 est supposé identique au profil mesuré en 2025.")
-
-    if coverage < 99:
-        st.warning(
-            "Il manque certains quarts d'heure dans la période théoriquement comparable. "
-            "Le résultat est calculé uniquement sur les intervalles réellement disponibles."
-        )
-
-    # Monthly detail
-    monthly = (
-        calc.set_index("timestamp")
-        .assign(
-            energy_kwh=calc.set_index("timestamp")["import_kWh"],
-            expected_slot=1,
-        )
-        .resample("MS")
-        .agg(
-            consommation_kWh=("energy_kwh", "sum"),
-            double_CHF=("double_cost_chf", "sum"),
-            vario_CHF=("vario_cost_chf", "sum"),
-            points=("expected_slot", "sum"),
-        )
-    )
-
-    monthly["economie_CHF"] = monthly["double_CHF"] - monthly["vario_CHF"]
-    monthly["economie_pct"] = (
-        monthly["economie_CHF"] / monthly["double_CHF"].replace(0, pd.NA) * 100
-    )
-
-    # Expected interval count for each calendar month, clipped to the actual comparison window.
-    comp_start = calc["timestamp"].min()
-    comp_end_exclusive = calc["timestamp"].max() + pd.Timedelta(minutes=15)
-
-    expected_counts = []
-    statuses = []
-    for month_start in monthly.index:
-        month_end = month_start + pd.offsets.MonthBegin(1)
-        start_clip = max(month_start, comp_start)
-        end_clip = min(month_end, comp_end_exclusive)
-        expected = max(0, int(round((end_clip - start_clip).total_seconds() / (meta.dt_hours * 3600))))
-        expected_counts.append(expected)
-
-        full_calendar_month = (start_clip == month_start) and (end_clip == month_end)
-        actual = int(monthly.loc[month_start, "points"])
-        cov = actual / expected * 100.0 if expected else 0.0
-
-        if full_calendar_month and cov >= 99.5:
-            statuses.append("Complet")
-        elif cov >= 99.5:
-            statuses.append("Partiel (début/fin période)")
-        else:
-            statuses.append(f"Incomplet ({cov:.1f} %)")
-
-    monthly["points_attendus"] = expected_counts
-    monthly["couverture_pct"] = monthly["points"] / monthly["points_attendus"].replace(0, pd.NA) * 100
-    monthly["statut"] = statuses
-
-    st.subheader("Comparaison mois par mois")
-
-    chart = monthly[["double_CHF", "vario_CHF"]].rename(
-        columns={"double_CHF": "Tarif Double", "vario_CHF": "Tarif VARIO"}
-    )
-    st.bar_chart(chart)
-
-    st.subheader("Économie VARIO par mois")
-    st.bar_chart(monthly[["economie_CHF"]].rename(columns={"economie_CHF": "Économie VARIO (CHF)"}))
-
-    display = monthly[
-        [
-            "consommation_kWh",
-            "double_CHF",
-            "vario_CHF",
-            "economie_CHF",
-            "economie_pct",
-            "couverture_pct",
-            "statut",
-        ]
-    ].copy()
-    display.index = display.index.strftime("%m.%Y")
-    display = display.rename(
-        columns={
-            "consommation_kWh": "Consommation (kWh)",
-            "double_CHF": "Double (CHF)",
-            "vario_CHF": "VARIO (CHF)",
-            "economie_CHF": "Économie (CHF)",
-            "economie_pct": "Économie (%)",
-            "couverture_pct": "Couverture (%)",
-            "statut": "Statut",
-        }
-    )
-    st.dataframe(display.round(2), use_container_width=True)
+    e1,e2,e3,e4 = st.columns(4)
+    e1.metric("Surplus disponible", f"{merged.export_kWh.sum():,.0f} kWh".replace(","," "))
+    e2.metric("PV stocké — VARIO", f"{var_bat.charge_kwh.sum():,.0f} kWh".replace(","," "))
+    e3.metric("Restitué — VARIO", f"{var_bat.discharge_kwh.sum():,.0f} kWh".replace(","," "))
+    e4.metric("Cycles équivalents", f"{var_bat.cycles:.0f}")
 
     st.caption(
-        "« Complet » signifie que tout le mois civil est couvert. "
-        "Le premier mois (décembre 2025) et le mois courant sont normalement indiqués comme partiels."
+        "Stratégie VARIO batterie : le surplus PV est stocké en priorité puis la batterie "
+        "est déchargée pendant les quarts d'heure situés dans les 25 % de prix les plus élevés "
+        "des prochaines 24 heures. La charge depuis le réseau n'est pas autorisée dans cette version."
     )
 
-    prices = calc.set_index("timestamp")[["double_tariff_chf_kwh", "vario_chf_kwh"]] * 100
-    prices.columns = ["Double (ct/kWh)", "VARIO (ct/kWh)"]
-    with st.expander("Voir les prix appliqués"):
-        st.line_chart(prices)
+    # Build per-interval costs for all four scenarios.
+    m = base.copy()
+    m["export_before_kWh"] = merged["export_kWh"].values
+    m["double_net"] = m["double_cost_chf"] - m["export_before_kWh"]*feed_in
+    m["vario_net"] = m["vario_cost_chf"] - m["export_before_kWh"]*feed_in
 
-    with st.expander("Contrôle quart d'heure"):
-        detail = calc[
-            [
-                "timestamp",
-                "import_kWh",
-                "double_tariff_chf_kwh",
-                "vario_chf_kwh",
-                "double_cost_chf",
-                "vario_cost_chf",
-            ]
-        ].copy()
-        detail["double_tariff_chf_kwh"] *= 100
-        detail["vario_chf_kwh"] *= 100
-        detail = detail.rename(
-            columns={
-                "double_tariff_chf_kwh": "Double ct/kWh",
-                "vario_chf_kwh": "VARIO ct/kWh",
-            }
-        )
+    # Recompute interval double prices for battery cost display.
+    idx = pd.DatetimeIndex(m["timestamp"])
+    hh = idx.hour + idx.minute/60
+    dbl_price = pd.Series(
+        ((hh>=7)&(hh<12) | (hh>=17)&(hh<23)),
+        index=m.index
+    ).map({True:ht_ct/100, False:bt_ct/100}).astype(float).values
+
+    m["double_battery"] = dbl_bat.import_after*dbl_price - dbl_bat.export_after*feed_in
+    m["vario_battery"] = var_bat.import_after*m["vario_chf_kwh"].values - var_bat.export_after*feed_in
+
+    monthly = m.set_index("timestamp")[["double_net","vario_net","double_battery","vario_battery"]].resample("MS").sum()
+    monthly["Mois"] = [MONTHS_FR[x.month] for x in monthly.index]
+    chart = monthly.set_index("Mois").rename(columns={
+        "double_net":"Double",
+        "vario_net":"VARIO",
+        "double_battery":"Double + batterie",
+        "vario_battery":"VARIO + batterie",
+    })
+
+    st.subheader("Coût mois par mois")
+    st.bar_chart(chart)
+
+    savings = pd.DataFrame(index=monthly.index)
+    savings["VARIO seul"] = monthly["double_net"] - monthly["vario_net"]
+    savings["Double + batterie"] = monthly["double_net"] - monthly["double_battery"]
+    savings["VARIO + batterie"] = monthly["double_net"] - monthly["vario_battery"]
+    savings["Mois"] = [MONTHS_FR[x.month] for x in savings.index]
+    st.subheader("Économie par mois vs Double")
+    st.bar_chart(savings.set_index("Mois"))
+
+    display = chart.copy()
+    display["Gain VARIO vs Double"] = display["Double"] - display["VARIO"]
+    display["Gain batterie Double"] = display["Double"] - display["Double + batterie"]
+    display["Gain VARIO + batterie"] = display["Double"] - display["VARIO + batterie"]
+    st.subheader("Détail mensuel")
+    st.dataframe(display.round(2), use_container_width=True)
+
+    with st.expander("Contrôle stratégie batterie VARIO"):
+        detail = pd.DataFrame({
+            "timestamp": merged["timestamp"],
+            "import_avant_kWh": merged["import_kWh"],
+            "export_avant_kWh": merged["export_kWh"],
+            "prix_VARIO_ct_kWh": merged["vario_chf_kwh"]*100,
+            "charge_batterie_kWh": var_bat.charge_kwh,
+            "decharge_batterie_kWh": var_bat.discharge_kwh,
+            "SOC_kWh": var_bat.soc_kwh,
+            "import_apres_kWh": var_bat.import_after,
+            "export_apres_kWh": var_bat.export_after,
+        })
         st.dataframe(detail, use_container_width=True, height=420, hide_index=True)
