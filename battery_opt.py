@@ -44,6 +44,8 @@ class OptimizedBatteryResult:
     cost_chf: float
     import_cost_chf: float
     export_revenue_chf: float
+    wear_cost_chf: float
+    economic_cost_chf: float
     cycles: float
     charged_kwh: float
     discharged_kwh: float
@@ -69,6 +71,7 @@ def optimize_battery(
     soc_min_pct: float = 5.0,
     soc_max_pct: float = 95.0,
     allow_grid_charge: bool = False,
+    wear_cost_chf_per_kwh: float = 0.0,
 ) -> OptimizedBatteryResult:
     """Find the minimum-cost dispatch over the full historical period."""
 
@@ -101,6 +104,7 @@ def optimize_battery(
     obj = np.zeros(nv, dtype=float)
     obj[G:G+n] = prices
     obj[E:E+n] = -float(feed_in_chf_kwh)
+    obj[D:D+n] = float(wear_cost_chf_per_kwh)
 
     # Bounds
     bounds = []
@@ -170,7 +174,9 @@ def optimize_battery(
 
     import_cost = float(np.dot(g, prices))
     export_revenue = float(e.sum() * float(feed_in_chf_kwh))
-    cost = import_cost - export_revenue
+    energy_bill_cost = import_cost - export_revenue
+    wear_cost = float(d.sum() * float(wear_cost_chf_per_kwh))
+    economic_cost = energy_bill_cost + wear_cost
 
     usable = soc_max - soc_min
     cycles = float(d.sum() / usable) if usable > 0 else 0.0
@@ -181,9 +187,11 @@ def optimize_battery(
         charge_kwh=c,
         discharge_kwh=d,
         soc_kwh=s,
-        cost_chf=cost,
+        cost_chf=energy_bill_cost,
         import_cost_chf=import_cost,
         export_revenue_chf=export_revenue,
+        wear_cost_chf=wear_cost,
+        economic_cost_chf=economic_cost,
         cycles=cycles,
         charged_kwh=float(c.sum()),
         discharged_kwh=float(d.sum()),
