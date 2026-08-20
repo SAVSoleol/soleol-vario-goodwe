@@ -61,7 +61,6 @@ with st.sidebar:
     transpose_to_2026 = st.toggle("Utiliser un profil 2025 comme profil 2026", value=True)
 
     st.header("2. Période d'analyse")
-    st.caption("La sélection des mois apparaît après lecture du fichier.")
 
     st.header("3. Tarif Double")
     ht_ct = st.number_input("Haut tarif (ct/kWh)", min_value=0.0, value=29.32, step=0.01)
@@ -165,31 +164,13 @@ else:
     display_double_df = period_df.copy()
     period_label = f"{start_label} à {end_label}"
 
-st.subheader(f"Période analysée : {period_label}")
+st.subheader(f"Période sélectionnée : {period_label}")
 
 # ---------------------------------------------------------------------- Double side
-double_prices_display = double_price_vector(display_double_df.timestamp, ht_ct/100, bt_ct/100)
-ht_mask = np.isclose(double_prices_display, ht_ct/100)
-bt_mask = ~ht_mask
-
-ht_kwh = float(display_double_df.loc[ht_mask, "import_kWh"].sum())
-bt_kwh = float(display_double_df.loc[bt_mask, "import_kWh"].sum())
-total_import = ht_kwh + bt_kwh
-ht_cost = ht_kwh * ht_ct/100
-bt_cost = bt_kwh * bt_ct/100
-double_import_cost = ht_cost + bt_cost
-
-# Reprise vector aligned to selected analysis period; for display Double use same calendar year as simulation,
-# because the comparison concerns the tariff scenario being tested.
-reprise_vec, reprise_labels = repurchase_vector(
-    period_df.timestamp,
-    installation_kw=installation_kw,
-    sell_go=sell_go,
-    provisional_ct=provisional_ct,
-)
-export_total = float(period_df.export_kWh.sum())
-export_revenue = float(np.dot(period_df.export_kWh.values, reprise_vec))
-double_net = double_import_cost - export_revenue
+# The visible Double vs VARIO comparison is intentionally calculated only after
+# the API merge, so both scenarios use EXACTLY the same quarter-hours.
+# This avoids comparing a full selected month on Double with only a partial
+# month available on VARIO.
 
 # ---------------------------------------------------------------------- Fetch VARIO early so right panel can be displayed
 today = pd.Timestamp.now(tz="Europe/Zurich").tz_localize(None)
@@ -212,77 +193,198 @@ data_q["timestamp"] = data_q["timestamp"].dt.floor("15min")
 merged = data_q.merge(vario, on="timestamp", how="inner") if not vario.empty else pd.DataFrame()
 
 if not merged.empty:
-    # Reprise vector must match actual common VARIO timestamps.
+    # Reprise vector must match the exact common VARIO timestamps.
     feed_vec, feed_labels = repurchase_vector(
         merged.timestamp,
         installation_kw=installation_kw,
         sell_go=sell_go,
         provisional_ct=provisional_ct,
     )
+
+    # -------------------- VARIO on common intervals
+    comparable_import_kwh = float(merged.import_kWh.sum())
+    comparable_export_kwh = float(merged.export_kWh.sum())
     vario_import_cost = float(np.dot(merged.import_kWh.values, merged.vario_chf_kwh.values))
     vario_export_revenue = float(np.dot(merged.export_kWh.values, feed_vec))
     vario_net = vario_import_cost - vario_export_revenue
     vario_avg_ct = (
-        vario_import_cost / merged.import_kWh.sum() * 100
-        if merged.import_kWh.sum() > 0 else 0.0
+        vario_import_cost / comparable_import_kwh * 100
+        if comparable_import_kwh > 0 else 0.0
     )
-    # Double on exactly same comparable intervals
+
+    # -------------------- DOUBLE on the exact same intervals
     dprices_common = double_price_vector(merged.timestamp, ht_ct/100, bt_ct/100)
-    double_common_import_cost = float(np.dot(merged.import_kWh.values, dprices_common))
+    ht_mask_common = np.isclose(dprices_common, ht_ct/100)
+    bt_mask_common = ~ht_mask_common
+
+    ht_kwh = float(merged.loc[ht_mask_common, "import_kWh"].sum())
+    bt_kwh = float(merged.loc[bt_mask_common, "import_kWh"].sum())
+    total_import = ht_kwh + bt_kwh
+
+    ht_cost = ht_kwh * ht_ct/100
+    bt_cost = bt_kwh * bt_ct/100
+    double_common_import_cost = ht_cost + bt_cost
+
     double_common_export_revenue = float(np.dot(merged.export_kWh.values, feed_vec))
     double_common_net = double_common_import_cost - double_common_export_revenue
+
+    # Shared export quantities for both scenarios.
+    export_total = comparable_export_kwh
+    export_revenue = double_common_export_revenue
+
     saving_vario = double_common_net - vario_net
+    saving_vario_pct = saving_vario / double_common_net * 100 if double_common_net else 0.0
+
+    ht_share = ht_kwh / total_import * 100 if total_import else 0.0
+    bt_share = bt_kwh / total_import * 100 if total_import else 0.0
 else:
     feed_vec = np.array([])
-    vario_import_cost = vario_export_revenue = vario_net = vario_avg_ct = saving_vario = 0.0
-    double_common_net = 0.0
+    comparable_import_kwh = comparable_export_kwh = 0.0
+    ht_kwh = bt_kwh = total_import = 0.0
+    ht_cost = bt_cost = double_common_import_cost = 0.0
+    export_total = export_revenue = 0.0
+    vario_import_cost = vario_export_revenue = vario_net = vario_avg_ct = 0.0
+    double_common_export_revenue = double_common_net = 0.0
+    saving_vario = saving_vario_pct = 0.0
+    ht_share = bt_share = 0.0
 
 # ---------------------------------------------------------------------- visual side-by-side tables
+if not merged.empty:
+    actual_start = merged.timestamp.min()
+    actual_end = merged.timestamp.max()
+    st.caption(
+        f"Comparaison réelle sur les mêmes quarts d'heure : "
+        f"{actual_start:%d.%m.%Y %H:%M} → {actual_end:%d.%m.%Y %H:%M} "
+        f"({len(merged):,} pas de 15 min).".replace(",", " ")
+    )
+
 left, right = st.columns(2)
 
 with left:
     st.markdown('<div class="section-shell">', unsafe_allow_html=True)
     st.markdown('<div class="compare-title">Tarif Double — HT / BT</div>', unsafe_allow_html=True)
-    st.markdown('<div class="compare-sub">Répartition du soutirage selon les plages haut et bas tarif.</div>', unsafe_allow_html=True)
-    ht_share = ht_kwh/total_import*100 if total_import else 0
-    bt_share = bt_kwh/total_import*100 if total_import else 0
+    st.markdown(
+        '<div class="compare-sub">Même période et mêmes quarts d’heure que VARIO. '
+        'Répartition du soutirage selon les plages haut et bas tarif.</div>',
+        unsafe_allow_html=True
+    )
+
     st.markdown(f"""
     <div class="kpi-grid">
-      <div class="kpi-card kpi-red"><div class="kpi-label">Consommation HT</div><div class="kpi-value">{ht_kwh:,.0f} kWh</div><div class="kpi-sub">{ht_share:.1f} %</div></div>
-      <div class="kpi-card kpi-red"><div class="kpi-label">Coût HT</div><div class="kpi-value">{ht_cost:,.2f} CHF</div><div class="kpi-sub">{ht_ct:.2f} ct/kWh</div></div>
-      <div class="kpi-card kpi-blue"><div class="kpi-label">Consommation BT</div><div class="kpi-value">{bt_kwh:,.0f} kWh</div><div class="kpi-sub">{bt_share:.1f} %</div></div>
-      <div class="kpi-card kpi-blue"><div class="kpi-label">Coût BT</div><div class="kpi-value">{bt_cost:,.2f} CHF</div><div class="kpi-sub">{bt_ct:.2f} ct/kWh</div></div>
-      <div class="kpi-card kpi-green"><div class="kpi-label">Consommation totale</div><div class="kpi-value">{total_import:,.0f} kWh</div><div class="kpi-sub">HT + BT</div></div>
-      <div class="kpi-card kpi-green"><div class="kpi-label">Coût achat total</div><div class="kpi-value">{double_import_cost:,.2f} CHF</div><div class="kpi-sub">hors frais fixes</div></div>
-      <div class="kpi-card kpi-purple"><div class="kpi-label">Export total</div><div class="kpi-value">{export_total:,.0f} kWh</div><div class="kpi-sub">injection réseau</div></div>
-      <div class="kpi-card kpi-purple"><div class="kpi-label">Revenus d'injection</div><div class="kpi-value">{export_revenue:,.2f} CHF</div><div class="kpi-sub">reprise Groupe E trimestrielle</div></div>
+      <div class="kpi-card kpi-red">
+        <div class="kpi-label">Consommation HT</div>
+        <div class="kpi-value">{ht_kwh:,.0f} kWh</div>
+        <div class="kpi-sub">{ht_share:.1f} % du soutirage</div>
+      </div>
+      <div class="kpi-card kpi-red">
+        <div class="kpi-label">Coût soutirage HT</div>
+        <div class="kpi-value">{ht_cost:,.2f} CHF</div>
+        <div class="kpi-sub">{ht_ct:.2f} ct/kWh</div>
+      </div>
+
+      <div class="kpi-card kpi-blue">
+        <div class="kpi-label">Consommation BT</div>
+        <div class="kpi-value">{bt_kwh:,.0f} kWh</div>
+        <div class="kpi-sub">{bt_share:.1f} % du soutirage</div>
+      </div>
+      <div class="kpi-card kpi-blue">
+        <div class="kpi-label">Coût soutirage BT</div>
+        <div class="kpi-value">{bt_cost:,.2f} CHF</div>
+        <div class="kpi-sub">{bt_ct:.2f} ct/kWh</div>
+      </div>
+
+      <div class="kpi-card kpi-green">
+        <div class="kpi-label">Soutirage total Double</div>
+        <div class="kpi-value">{total_import:,.0f} kWh</div>
+        <div class="kpi-sub">HT + BT</div>
+      </div>
+      <div class="kpi-card kpi-green">
+        <div class="kpi-label">Coût soutirage Double</div>
+        <div class="kpi-value">{double_common_import_cost:,.2f} CHF</div>
+        <div class="kpi-sub">avant revenus d'injection</div>
+      </div>
+
+      <div class="kpi-card kpi-purple">
+        <div class="kpi-label">Export total</div>
+        <div class="kpi-value">{export_total:,.0f} kWh</div>
+        <div class="kpi-sub">mêmes quarts d'heure</div>
+      </div>
+      <div class="kpi-card kpi-purple">
+        <div class="kpi-label">Revenus d'injection</div>
+        <div class="kpi-value">{double_common_export_revenue:,.2f} CHF</div>
+        <div class="kpi-sub">reprise Groupe E trimestrielle</div>
+      </div>
+
+      <div class="kpi-card kpi-orange">
+        <div class="kpi-label">Coût net Double</div>
+        <div class="kpi-value">{double_common_net:,.2f} CHF</div>
+        <div class="kpi-sub">soutirage - revenus d'injection</div>
+      </div>
+      <div class="kpi-card kpi-orange">
+        <div class="kpi-label">Référence de comparaison</div>
+        <div class="kpi-value">100 %</div>
+        <div class="kpi-sub">base pour calculer le gain VARIO</div>
+      </div>
     </div>
     """.replace(",", " "), unsafe_allow_html=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 with right:
     st.markdown('<div class="section-shell">', unsafe_allow_html=True)
     st.markdown('<div class="compare-title">Tarif VARIO — prix dynamique</div>', unsafe_allow_html=True)
-    st.markdown('<div class="compare-sub">Même profil, mais chaque quart d’heure est facturé au prix VARIO réel.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="compare-sub">Exactement le même soutirage et le même export, '
+        'mais chaque quart d’heure est valorisé au prix VARIO réel.</div>',
+        unsafe_allow_html=True
+    )
+
     if merged.empty:
         st.warning("Pas de prix VARIO disponible sur cette période.")
     else:
         st.markdown(f"""
         <div class="kpi-grid">
-          <div class="kpi-card kpi-blue"><div class="kpi-label">Consommation comparée</div><div class="kpi-value">{merged.import_kWh.sum():,.0f} kWh</div><div class="kpi-sub">{len(merged):,} quarts d'heure</div></div>
-          <div class="kpi-card kpi-blue"><div class="kpi-label">Coût achat VARIO</div><div class="kpi-value">{vario_import_cost:,.2f} CHF</div><div class="kpi-sub">prix moyen {vario_avg_ct:.2f} ct/kWh</div></div>
-          <div class="kpi-card kpi-purple"><div class="kpi-label">Export total</div><div class="kpi-value">{merged.export_kWh.sum():,.0f} kWh</div><div class="kpi-sub">sur la période comparable</div></div>
-          <div class="kpi-card kpi-purple"><div class="kpi-label">Revenus d'injection</div><div class="kpi-value">{vario_export_revenue:,.2f} CHF</div><div class="kpi-sub">reprise Groupe E trimestrielle</div></div>
-          <div class="kpi-card kpi-green"><div class="kpi-label">Coût net VARIO</div><div class="kpi-value">{vario_net:,.2f} CHF</div><div class="kpi-sub">achat - revenus d'injection</div></div>
-          <div class="kpi-card kpi-orange"><div class="kpi-label">Économie vs Double</div><div class="kpi-value">{saving_vario:,.2f} CHF</div><div class="kpi-sub">{(saving_vario/double_common_net*100 if double_common_net else 0):+.1f} %</div></div>
+          <div class="kpi-card kpi-blue">
+            <div class="kpi-label">Soutirage total VARIO</div>
+            <div class="kpi-value">{comparable_import_kwh:,.0f} kWh</div>
+            <div class="kpi-sub">identique au Double</div>
+          </div>
+          <div class="kpi-card kpi-blue">
+            <div class="kpi-label">Coût soutirage VARIO</div>
+            <div class="kpi-value">{vario_import_cost:,.2f} CHF</div>
+            <div class="kpi-sub">prix moyen {vario_avg_ct:.2f} ct/kWh</div>
+          </div>
+
+          <div class="kpi-card kpi-purple">
+            <div class="kpi-label">Export total</div>
+            <div class="kpi-value">{comparable_export_kwh:,.0f} kWh</div>
+            <div class="kpi-sub">identique au Double</div>
+          </div>
+          <div class="kpi-card kpi-purple">
+            <div class="kpi-label">Revenus d'injection</div>
+            <div class="kpi-value">{vario_export_revenue:,.2f} CHF</div>
+            <div class="kpi-sub">même reprise Groupe E</div>
+          </div>
+
+          <div class="kpi-card kpi-green">
+            <div class="kpi-label">Coût net VARIO</div>
+            <div class="kpi-value">{vario_net:,.2f} CHF</div>
+            <div class="kpi-sub">soutirage - revenus d'injection</div>
+          </div>
+          <div class="kpi-card kpi-green">
+            <div class="kpi-label">Économie VARIO vs Double</div>
+            <div class="kpi-value">{saving_vario:,.2f} CHF</div>
+            <div class="kpi-sub">{saving_vario_pct:+.1f} %</div>
+          </div>
         </div>
         """.replace(",", " "), unsafe_allow_html=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------- quarterly repurchase summary
 st.subheader("Reprise photovoltaïque Groupe E appliquée")
 qsum = quarterly_summary(
-    period_df.timestamp,
+    merged.timestamp if not merged.empty else period_df.timestamp,
     installation_kw=installation_kw,
     sell_go=sell_go,
     provisional_ct=provisional_ct,
