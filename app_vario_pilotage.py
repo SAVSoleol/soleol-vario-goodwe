@@ -7,7 +7,6 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 from billing import compare_double_vario
 from groupe_e_api import fetch_vario
@@ -434,7 +433,35 @@ if st.button("Optimiser la batterie", type="primary"):
             st.error(str(exc))
             st.stop()
 
+    # Conserver les résultats afin que le sélecteur de journée puisse provoquer
+    # un rerun Streamlit sans faire disparaître toute la simulation.
+    st.session_state["battery_analysis"] = {
+        "vario_pv": vario_pv,
+        "vario_grid": vario_grid,
+        "signature": (
+            float(capacity), float(power), float(efficiency), int(soc_min), int(soc_max),
+            bool(allow_grid_charge), float(wear_ct),
+            str(merged.timestamp.min()), str(merged.timestamp.max()), len(merged),
+        ),
+    }
+
+battery_run = st.session_state.get("battery_analysis")
+current_signature = (
+    float(capacity), float(power), float(efficiency), int(soc_min), int(soc_max),
+    bool(allow_grid_charge), float(wear_ct),
+    str(merged.timestamp.min()), str(merged.timestamp.max()), len(merged),
+)
+
+if battery_run is None:
+    st.caption("Clique sur « Optimiser la batterie » pour afficher les résultats et le pilotage journalier.")
+else:
+    if battery_run.get("signature") != current_signature:
+        st.warning("Les paramètres ont changé depuis la dernière optimisation. Clique à nouveau sur « Optimiser la batterie » pour actualiser les résultats.")
+
+    vario_pv = battery_run["vario_pv"]
+    vario_grid = battery_run["vario_grid"]
     best = vario_grid if vario_grid is not None else vario_pv
+    wear = wear_ct/100
     period_days = len(merged)*meta.dt_hours/24
     annual_factor = 365/period_days if period_days else 0
 
@@ -480,11 +507,11 @@ if st.button("Optimiser la batterie", type="primary"):
     with tab1:
         ren={"double":"Double","vario":"VARIO","vario_pv":"VARIO + batterie PV","vario_grid":"VARIO + arbitrage"}
         st.bar_chart(monthly.set_index("Mois")[mcols].rename(columns=ren))
-    @st.fragment
-    def render_battery_pilotage(chosen):
+
+    with tab2:
         chosen = best
         control = pd.DataFrame({
-            "timestamp": pd.to_datetime(merged.timestamp.values),
+            "timestamp": pd.to_datetime(merged.timestamp),
             "prix_VARIO_ct_kWh": merged.vario_chf_kwh.values*100,
             "reprise_PV_ct_kWh": np.asarray(feed_vec)*100,
             "import_avant_kWh": merged.import_kWh.values,
@@ -496,50 +523,91 @@ if st.button("Optimiser la batterie", type="primary"):
             "export_apres_kWh": chosen.export_after,
         })
         control["date"] = control["timestamp"].dt.date
-        days = sorted(control["date"].unique())
-        activity = control.assign(a=control.charge_kWh+control.decharge_kWh).groupby("date")["a"].sum()
-        default_day = activity.idxmax() if len(activity) else days[0]
-        selected_day = st.selectbox("Journée à visualiser", days, index=days.index(default_day),
-            format_func=lambda d: pd.Timestamp(d).strftime("%d.%m.%Y"))
-        day = control[control.date == selected_day].copy()
-        dt_h = float(meta.dt_hours)
-        day["battery_kw"] = day.charge_kWh/dt_h - day.decharge_kWh/dt_h
-        day["soc_pct"] = day.SOC_kWh/float(capacity)*100 if capacity else 0
-        usable = float(capacity)*(float(soc_max)-float(soc_min))/100
-        charged = float(day.charge_kWh.sum()); discharged = float(day.decharge_kWh.sum())
-        cycles_day = discharged/usable if usable > 0 else 0
-        base_cost = float((day.import_avant_kWh*day.prix_VARIO_ct_kWh/100-day.export_avant_kWh*day.reprise_PV_ct_kWh/100).sum())
-        batt_cost = float((day.import_apres_kWh*day.prix_VARIO_ct_kWh/100-day.export_apres_kWh*day.reprise_PV_ct_kWh/100).sum())
-        net_day = base_cost-batt_cost-discharged*wear_ct/100
-        k1,k2,k3,k4 = st.columns(4)
-        k1.metric("Énergie chargée", f"{charged:.1f} kWh")
-        k2.metric("Énergie déchargée", f"{discharged:.1f} kWh")
-        k3.metric("Cycles équivalents", f"{cycles_day:.2f}")
-        k4.metric("Économie nette du jour", f"{net_day:.2f} CHF")
+        available_days = sorted(control["date"].unique())
 
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        pos=day.battery_kw>1e-9; neg=day.battery_kw<-1e-9
-        fig.add_trace(go.Bar(x=day.loc[pos,"timestamp"], y=day.loc[pos,"battery_kw"], name="Charge batterie (+kW)", marker_color="#4ade80"), secondary_y=False)
-        fig.add_trace(go.Bar(x=day.loc[neg,"timestamp"], y=day.loc[neg,"battery_kw"], name="Décharge batterie (-kW)", marker_color="#ef4444"), secondary_y=False)
-        fig.add_trace(go.Scatter(x=day.timestamp,y=day.prix_VARIO_ct_kWh,mode="lines",name="Prix achat VARIO (ct/kWh)",line=dict(color="#60a5fa",width=2.5)),secondary_y=True)
-        fig.add_trace(go.Scatter(x=day.timestamp,y=day.reprise_PV_ct_kWh,mode="lines",name="Prix reprise PV (ct/kWh)",line=dict(color="#f472b6",width=2.2)),secondary_y=True)
-        mp=max(float(power),float(day.battery_kw.abs().max()),1); mpr=max(float(day.prix_VARIO_ct_kWh.max()),float(day.reprise_PV_ct_kWh.max()),1)
-        fig.update_yaxes(title_text="Puissance batterie (kW)",range=[-mp*1.15,mp*1.15],secondary_y=False)
-        fig.update_yaxes(title_text="Prix (ct/kWh)",range=[0,mpr*1.15],secondary_y=True)
-        fig.update_xaxes(title_text="Heure",tickformat="%H:%M",dtick=7200000)
-        fig.update_layout(title=f"Puissance batterie et prix de l'électricité — {pd.Timestamp(selected_day):%d.%m.%Y}",height=520,barmode="relative",hovermode="x unified",legend=dict(orientation="h",y=1.12))
-        st.plotly_chart(fig,use_container_width=True,config={"displaylogo":False})
+        st.markdown("### Pilotage journalier de la batterie – 15 min")
+        st.caption("Visualisez quand la batterie se charge ou se décharge et les prix VARIO sur la journée sélectionnée.")
+        selected_day = st.selectbox(
+            "Date", available_days, index=0,
+            format_func=lambda d: pd.Timestamp(d).strftime("%d.%m.%Y"),
+            key="battery_dispatch_day",
+        )
+        day = control.loc[control["date"] == selected_day].copy()
 
-        socfig=go.Figure(go.Scatter(x=day.timestamp,y=day.soc_pct,mode="lines",line=dict(color="#fbbf24",width=2.5),fill="tozeroy",name="SOC"))
-        socfig.update_xaxes(title_text="Heure",tickformat="%H:%M",dtick=7200000); socfig.update_yaxes(title_text="SOC (%)",range=[0,100])
-        socfig.update_layout(title="État de charge (SOC) de la batterie",height=300,showlegend=False,hovermode="x unified")
-        st.plotly_chart(socfig,use_container_width=True,config={"displaylogo":False})
+        if day.empty:
+            st.warning("Aucune donnée disponible pour cette journée.")
+        else:
+            dt_h = float(meta.dt_hours)
+            if dt_h <= 0:
+                st.error("Pas de temps invalide : impossible de convertir les kWh en kW.")
+                st.stop()
 
-        table=day.copy(); table["Heure"]=table.timestamp.dt.strftime("%H:%M")
-        table["Mode"]=np.select([table.charge_kWh>1e-9,table.decharge_kWh>1e-9],["Charge","Décharge"],default="Repos")
-        table["Puissance batterie (kW)"]=table.battery_kw.round(2); table["SOC (%)"]=table.soc_pct.round(1)
-        table["Prix achat VARIO (ct/kWh)"]=table.prix_VARIO_ct_kWh.round(2); table["Prix reprise PV (ct/kWh)"]=table.reprise_PV_ct_kWh.round(2)
-        st.dataframe(table[["Heure","Puissance batterie (kW)","SOC (%)","Prix achat VARIO (ct/kWh)","Prix reprise PV (ct/kWh)","Mode"]],use_container_width=True,hide_index=True,height=360)
+            day["charge_kW"] = day["charge_kWh"] / dt_h
+            day["decharge_kW"] = -day["decharge_kWh"] / dt_h
+            usable_kwh = capacity * max(0.0, (soc_max-soc_min)/100.0)
+            day["SOC_pct"] = day["SOC_kWh"] / float(capacity) * 100.0 if capacity > 0 else 0.0
+            day["SOC_pct"] = day["SOC_pct"].clip(0, 100)
 
-    with tab2:
-        render_battery_pilotage(best)
+            charged = float(day["charge_kWh"].sum())
+            discharged = float(day["decharge_kWh"].sum())
+            cycles_day = discharged / usable_kwh if usable_kwh > 0 else 0.0
+            wear_day = discharged * wear
+            bill_before_day = float((day["import_avant_kWh"] * day["prix_VARIO_ct_kWh"]/100 - day["export_avant_kWh"] * day["reprise_PV_ct_kWh"]/100).sum())
+            bill_after_day = float((day["import_apres_kWh"] * day["prix_VARIO_ct_kWh"]/100 - day["export_apres_kWh"] * day["reprise_PV_ct_kWh"]/100).sum())
+            gross_saving_day = bill_before_day - bill_after_day
+            net_saving_day = gross_saving_day - wear_day
+
+            k1,k2,k3,k4 = st.columns(4)
+            k1.metric("Énergie chargée", f"{charged:.1f} kWh")
+            k2.metric("Énergie déchargée", f"{discharged:.1f} kWh")
+            k3.metric("Cycles équivalents (jour)", f"{cycles_day:.2f}")
+            k4.metric("Économie brute (jour)", f"{gross_saving_day:.2f} CHF", help=f"Gain net après usure : {net_saving_day:.2f} CHF · usure : {wear_day:.2f} CHF")
+
+            st.markdown("#### 1. Puissance batterie et prix de l’électricité")
+            fig = go.Figure()
+            fig.add_bar(x=day["timestamp"], y=day["charge_kW"], name="Charge batterie (+kW)", marker_color="#4ade80")
+            fig.add_bar(x=day["timestamp"], y=day["decharge_kW"], name="Décharge batterie (-kW)", marker_color="#ef4444")
+            fig.add_trace(go.Scatter(x=day["timestamp"], y=day["prix_VARIO_ct_kWh"], name="Prix d'achat VARIO (ct/kWh)", mode="lines", line=dict(color="#60a5fa", width=2.4), yaxis="y2"))
+            fig.add_trace(go.Scatter(x=day["timestamp"], y=day["reprise_PV_ct_kWh"], name="Prix de reprise PV (ct/kWh)", mode="lines", line=dict(color="#ec4899", width=2.2), yaxis="y2"))
+            fig.update_layout(
+                barmode="relative", height=470, hovermode="x unified",
+                margin=dict(l=10,r=10,t=20,b=10),
+                legend=dict(orientation="h", y=1.10, x=0),
+                xaxis=dict(title=None, tickformat="%H:%M", dtick=7200000, gridcolor="rgba(148,163,184,.12)"),
+                yaxis=dict(title="Puissance batterie (kW)", range=[-max(power*1.12,1), max(power*1.12,1)], zeroline=True, zerolinewidth=2, zerolinecolor="rgba(255,255,255,.45)", gridcolor="rgba(148,163,184,.12)"),
+                yaxis2=dict(title="Prix (ct/kWh)", overlaying="y", side="right", rangemode="tozero", showgrid=False),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+            st.markdown("#### 2. État de charge (SOC) de la batterie")
+            socfig = go.Figure()
+            socfig.add_trace(go.Scatter(
+                x=day["timestamp"], y=day["SOC_pct"], name="SOC", mode="lines",
+                line=dict(color="#fbbf24", width=2.6), fill="tozeroy", fillcolor="rgba(251,191,36,.18)"
+            ))
+            socfig.update_layout(
+                height=270, hovermode="x unified", showlegend=False,
+                margin=dict(l=10,r=10,t=10,b=10),
+                xaxis=dict(title=None, tickformat="%H:%M", dtick=7200000, gridcolor="rgba(148,163,184,.12)"),
+                yaxis=dict(title="SOC (%)", range=[0,100], dtick=25, gridcolor="rgba(148,163,184,.12)"),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(socfig, use_container_width=True, config={"displaylogo": False})
+
+            st.markdown("#### 3. Détail au pas de 15 minutes")
+            detail_day = pd.DataFrame({
+                "Heure": day["timestamp"].dt.strftime("%H:%M"),
+                "Puissance batterie (kW)": (day["charge_kW"] + day["decharge_kW"]).round(2),
+                "Énergie chargée (kWh)": day["charge_kWh"].round(3),
+                "Énergie déchargée (kWh)": day["decharge_kWh"].round(3),
+                "SOC (%)": day["SOC_pct"].round(1),
+                "Prix achat VARIO (ct/kWh)": day["prix_VARIO_ct_kWh"].round(3),
+                "Prix reprise PV (ct/kWh)": day["reprise_PV_ct_kWh"].round(3),
+            })
+            detail_day["Mode"] = np.select(
+                [detail_day["Puissance batterie (kW)"] > 1e-6, detail_day["Puissance batterie (kW)"] < -1e-6],
+                ["Charge", "Décharge"], default="Repos"
+            )
+            with st.expander("Afficher le tableau détaillé", expanded=False):
+                st.dataframe(detail_day, use_container_width=True, height=430, hide_index=True)
